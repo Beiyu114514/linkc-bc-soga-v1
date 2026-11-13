@@ -1,0 +1,119 @@
+package panel
+
+import (
+	"context"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"path/filepath"
+	"sync/atomic"
+	"testing"
+
+	"github.com/Beiyu114514/linkc-bc-soga-v1/internal/m0/mockpanel"
+	"github.com/Beiyu114514/linkc-bc-soga-v1/internal/store"
+)
+
+func newMock(t *testing.T) (*mockpanel.Panel, *httptest.Server, *Client, *store.Store) {
+	t.Helper()
+	p := mockpanel.New(mockpanel.Config{
+		APIKey: "key", NodeID: 7, NodeType: "vless",
+		Port: 443, StreamType: "tcp", TLSType: "none", TrafficRate: 1,
+		PullInterval: -1, PushInterval: -1,
+	})
+	p.SetUsers(mockpanel.User{ID: 1, UUID: "701534e1-8540-49f3-87af-71680a1b97ff", TransferEnable: 1 << 40, Enable: true})
+	srv := httptest.NewServer(p)
+	t.Cleanup(srv.Close)
+	st, err := store.Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+	c, err := New(Options{
+		BaseURL: srv.URL, APIKey: "key", NodeID: "7", NodeType: "vless",
+		AllowHTTP: true, MaxAttempts: 1,
+	}, st)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return p, srv, c, st
+}
+
+func TestFetchETagAndPush(t *testing.T) {
+	p, _, c, _ := newMock(t)
+	ctx := context.Background()
+	n, changed, err := c.FetchNode(ctx)
+	if err != nil || !changed || n.Config.Port != 443 || n.NodeType != "vless" {
+		t.Fatalf("node=%+v changed=%v err=%v", n, changed, err)
+	}
+	u, changed, err := c.FetchUsers(ctx)
+	if err != nil || !changed || len(u) != 1 || u[0].ID != 1 {
+		t.Fatalf("users=%+v changed=%v err=%v", u, changed, err)
+	}
+	if _, changed, err := c.FetchNode(ctx); err != nil || changed {
+		t.Fatalf("second node changed=%v err=%v", changed, err)
+	}
+	if _, changed, err := c.FetchUsers(ctx); err != nil || changed {
+		t.Fatalf("second users changed=%v err=%v", changed, err)
+	}
+	if err := c.PushTraffic(ctx, []Traffic{{ID: 1, U: 10, D: 20}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.PushStatus(ctx, Status{CPUPercent: 23.5, MemTotal: 100, MemUsed: 50, Uptime: 10}, "load_fraction"); err != nil {
+		t.Fatal(err)
+	}
+	s := p.Snapshot()
+	if len(s.Traffic) != 1 || s.Traffic[0].U != 10 || s.Traffic[0].D != 20 {
+		t.Fatalf("traffic = %+v", s.Traffic)
+	}
+	if len(s.InfoLogs) != 1 || s.InfoLogs[0].Load != "0.235000" {
+		t.Fatalf("info = %+v", s.InfoLogs)
+	}
+	if len(s.Online) != 1 || s.Online[0].OnlineUser != 1 {
+		t.Fatalf("online = %+v", s.Online)
+	}
+
+	p.SetUsers()
+	u, changed, err = c.FetchUsers(ctx)
+	if err != nil || !changed || len(u) != 0 {
+		t.Fatalf("empty users=%+v changed=%v err=%v", u, changed, err)
+	}
+}
+
+func TestRetryAndErrors(t *testing.T) {
+	var n atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if n.Add(1) < 3 {
+			http.Error(w, "busy", http.StatusServiceUnavailable)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"basic": map[string]any{}, "config": map[string]any{"port": 443}, "node_type": "vless",
+		})
+	}))
+	defer srv.Close()
+	c, err := New(Options{BaseURL: srv.URL, APIKey: "k", NodeID: "1", AllowHTTP: true,
+		MaxAttempts: 3, RetryBase: timeMillisecond}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := c.FetchNode(context.Background()); err != nil {
+		t.Fatalf("retry failed: %v", err)
+	}
+	if n.Load() != 3 {
+		t.Fatalf("requests = %d", n.Load())
+	}
+
+	bad := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "no", http.StatusUnauthorized)
+	}))
+	defer bad.Close()
+	c2, _ := New(Options{BaseURL: bad.URL, APIKey: "k", NodeID: "1", AllowHTTP: true, MaxAttempts: 3}, nil)
+	_, _, err = c2.FetchNode(context.Background())
+	if err == nil || !IsStatus(err, http.StatusUnauthorized) {
+		t.Fatalf("err = %v", err)
+	}
+}
+
+// timeMillisecond avoids importing time in the test body above.
+const timeMillisecond = 1_000_000

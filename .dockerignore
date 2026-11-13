@@ -1,0 +1,7 @@
+.git
+.idea
+.vscode
+*.db
+*.db.bak
+tmp
+dist

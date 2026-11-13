@@ -1,0 +1,117 @@
+# /etc/linkc-node/config.yaml
+# Permissions: 0600; directory: 0700.
+panel:
+  # Keep the exact path the panel uses for authorization/binding.
+  base_url: "https://panel.example.com/"
+  profile: "sspanel-uim-soga"
+  api_key: "${PANEL_API_KEY}"          # or api_key_file: /etc/linkc-node/api-key
+  node_id: "12"
+  node_type: "vless"
+  timeout: 15s
+  allow_http: false
+  follow_redirects: false
+  tls:
+    verify: true
+    ca_file: ""
+    server_name: ""
+    client_cert_file: ""
+    client_key_file: ""
+  proxy: ""                            # optional http:// proxy
+  max_response_bytes: 33554432
+  max_attempts: 3
+
+node:
+  listen: "0.0.0.0"
+  pull_interval: 60s
+  push_interval: 60s
+  collect_interval: 30s
+  status_interval: 5s
+
+  tls:
+    # Required when the panel returns tls_type=tls. MVP supports one cert pair.
+    certificates: []
+    #  - cert_file: "/etc/linkc/fullchain.pem"
+    #    key_file:  "/etc/linkc/privkey.pem"
+    alpn: []
+    min_version: ""
+    ech_server_keys: ""                # base64 ECHKeySetList, tls only
+
+  reality:
+    xver: 0
+
+  # Optional local extensions; the target site does not send these fields.
+  # They are used when the panel leaves the corresponding field empty.
+  vless:
+    decryption: "none"
+  xhttp:
+    host: ""
+    path: ""
+    mode: "auto"                     # auto | packet-up | stream-up | stream-one
+    headers: {}
+  grpc:
+    authority: ""
+    service_name: ""
+    multi_mode: false
+    idle_timeout: 0
+    health_check_timeout: 0
+    permit_without_stream: false
+    initial_windows_size: 0
+    user_agent: ""
+
+  sniffing:
+    mode: "auto"                       # auto | off
+
+  limits:
+    mode: "enforce"                    # enforce | report | off
+    device_limit_ipv6_prefix: 128
+    burst_bytes: 65536
+
+  freedom:
+    # Keep false in production to block SSRF to private/loopback targets.
+    allow_private_targets: false
+
+  users:
+    allow_empty: true                  # sspanel-uim-soga: [] is legal
+    mass_remove_guard: "warn"          # warn | reject
+    max_users: 100000
+
+  traffic:
+    # true: 额外发送一份 0/0 的在线用户列表，使站点 online_user 更准确。
+    include_online_zero: false
+    batch_users: 500
+    batch_bytes: 1048576
+
+  alive_ip:
+    mode: "changed"                    # changed | full
+    full_every: 20                     # changed 模式下每 N 次补一次全量
+    clear_offline: false               # 目标站点不清除离线 IP
+
+  status:
+    mode: "load_fraction"              # load is CPU fraction (0..1)
+
+  audit:
+    # 建议先 report 观察命中，再切 block。
+    enabled: true
+    action: "report"                   # block | report
+    rule_mode: "auto"                  # auto | regex | keyword | prefixed
+    whitelist_file: ""                 # 每行一条，支持 # 注释
+    dedupe_ttl: 24h
+    strict_rules: false
+    resolve_domain_for_ip_rules: true  # 域名目标上的 ip:/geoip: 规则本地解析
+
+  geodata:
+    dir: "/usr/share/xray"             # geosite.dat / geoip.dat
+    auto_update: false
+
+storage:
+  path: "/var/lib/linkc-node"
+  max_journal_bytes: 67108864
+
+logging:
+  level: "info"                        # debug | info | warn | error
+  format: "json"                       # json | text
+
+admin:
+  socket: "/run/linkc-node/admin.sock"
+  metrics: true
+  pprof: false

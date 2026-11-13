@@ -1,0 +1,6 @@
+/linkc-node
+/dist/
+*.db
+*.db.bak
+*.db.lock
+.DS_Store

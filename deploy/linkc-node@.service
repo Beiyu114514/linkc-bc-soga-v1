@@ -1,0 +1,41 @@
+[Unit]
+Description=LinkC soga-v1 node agent (%i)
+Documentation=https://github.com/Beiyu114514/linkc-bc-soga-v1
+After=network-online.target time-sync.target
+Wants=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=linkc
+Group=linkc
+ExecStart=/usr/local/bin/linkc-node run -c /etc/linkc-node/%i.yaml
+Restart=on-failure
+RestartSec=3
+LimitNOFILE=1048576
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+ProtectKernelModules=true
+LockPersonality=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+ProtectClock=true
+ProtectHostname=true
+SystemCallArchitectures=native
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+StateDirectory=linkc-node-%i
+StateDirectoryMode=0700
+RuntimeDirectory=linkc-node-%i
+RuntimeDirectoryMode=0700
+ReadWritePaths=/var/lib/linkc-node-%i /run/linkc-node-%i
+
+[Install]
+WantedBy=multi-user.target
