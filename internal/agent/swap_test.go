@@ -48,7 +48,13 @@ func TestSyncAddFailureKeepsOldAndRetries(t *testing.T) {
 		TransferEnable: 1 << 40, Enable: true, ExpireIn: time.Now().Add(time.Hour),
 	})
 
-	waitFor(t, "apply failure", func() bool { return a.Snapshot().LastError != "" })
+	// LastError is set by the failed swap before the same Sync applies the new
+	// user list, so wait for both: asserting Users right after LastError is
+	// racy and made this test flaky under load.
+	waitFor(t, "apply failure", func() bool {
+		s := a.Snapshot()
+		return s.LastError != "" && s.Users == 2
+	})
 	s := a.Snapshot()
 	if s.Port != portA {
 		t.Fatalf("engine port = %d, want the old port %d", s.Port, portA)
