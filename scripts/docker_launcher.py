@@ -232,7 +232,7 @@ def default_values() -> dict[str, Any]:
         "pull_latest": True,
         "build_local": False,
         "run_check": True,
-        "no_new_privileges": True,
+        "no_new_privileges": False,
         "selinux_relabel": False,
         "log_level": "info",
         "log_format": "json",
@@ -1420,6 +1420,17 @@ def collect_warnings(
         add("info", "非 root 运行：容器将使用 --user UID:GID，配置/数据目录需由当前用户可写。")
     else:
         add("info", "root 运行：配置/数据目录将 chown 到 10001:10001。")
+    if values["no_new_privileges"]:
+        add(
+            "warn",
+            "已启用 no-new-privileges；它会禁用镜像内 linkc-node 的 CAP_NET_BIND_SERVICE "
+            "文件能力，面板端口 <1024 时容器将无法绑定。",
+        )
+    else:
+        add(
+            "info",
+            "镜像内 linkc-node 已设置 CAP_NET_BIND_SERVICE 文件能力，非 root 也可绑定低端口。",
+        )
     if values["build_local"] and not (repo_root / "Dockerfile").is_file():
         add("bad", "已勾选本地构建，但仓库根目录没有 Dockerfile。")
     if values["build_local"] and values["pull_latest"]:

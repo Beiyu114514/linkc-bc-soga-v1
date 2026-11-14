@@ -65,10 +65,13 @@ docker build -t linkc-node .
 docker run --rm --network host \
   -v /etc/linkc-node:/etc/linkc-node:ro \
   -v /var/lib/linkc-node:/var/lib/linkc-node \
+  -v /var/lib/linkc-node/run:/run/linkc-node \
   linkc-node
 ```
 
 必须使用 `--network host`：端口映射会丢失真实源 IP，影响在线 IP 与设备数限制。
+
+镜像内 `linkc-node` 已设置 `CAP_NET_BIND_SERVICE` 文件能力，容器仍以 UID 10001 运行，因此面板下发 440/443 等低端口也能绑定。不要额外加 `--security-opt no-new-privileges:true`，它会禁用该文件能力；只有确认端口 >=1024 时才建议开启。
 
 预构建镜像（由 `.github/workflows/docker.yml` 推送，多架构 amd64/arm64）：
 
@@ -77,6 +80,7 @@ docker pull ghcr.io/beiyu114514/linkc-bc-soga-v1:latest
 docker run --rm --network host \
   -v /etc/linkc-node:/etc/linkc-node:ro \
   -v /var/lib/linkc-node:/var/lib/linkc-node \
+  -v /var/lib/linkc-node/run:/run/linkc-node \
   ghcr.io/beiyu114514/linkc-bc-soga-v1:latest
 ```
 

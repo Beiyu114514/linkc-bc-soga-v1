@@ -247,6 +247,7 @@ curl --unix-socket /var/lib/linkc-node/run/admin.sock http://localhost/metrics
 
 ## 安全说明
 
+- 低端口：镜像内 `linkc-node` 只带 `CAP_NET_BIND_SERVICE` 文件能力，容器仍以 UID 10001 运行；`no-new-privileges` 默认关闭，否则会禁用该能力。
 - 页面默认监听 `0.0.0.0`，每次启动生成随机 token；页面 URL 和 API 请求都需要 token。
 - 监听 `0.0.0.0` 时必须用 `--username` 启用登录（否则拒绝启动）；仅本机可用 `--bind 127.0.0.1`。
 - HTTP Basic Auth 用户名/密码（`--username`）；非回环监听必需，启用后与 token 叠加，两层都通过才进入。
@@ -276,7 +277,6 @@ docker run -d \
   --log-opt max-size=10m \
   --log-opt max-file=3 \
   --label com.linkc.managed-by=linkc-docker-launcher \
-  --security-opt no-new-privileges:true \
   -v /etc/linkc-node:/etc/linkc-node:ro \
   -v /var/lib/linkc-node:/var/lib/linkc-node \
   -v /var/lib/linkc-node/run:/run/linkc-node \
@@ -285,11 +285,17 @@ docker run -d \
 
 必须使用 `--network host`：端口映射会丢失真实源 IP，影响 `alive_ip` 和设备数限制。
 
+镜像内 `/usr/local/bin/linkc-node` 已设置 `CAP_NET_BIND_SERVICE` 文件能力，容器仍以 UID 10001 运行，因此面板下发 440/443 等低端口也能绑定。`--security-opt no-new-privileges:true` 会禁用文件能力；页面上的“no-new-privileges”复选框默认关闭，只有确认面板端口 >=1024 时才建议开启。
+
 ## 常见问题
 
 **页面打不开 / 提示需要 token**
 
 复制终端里完整地址（包含 `?token=`）。如果通过 SSH 转发，确认本地端口和 `--port` 一致。
+
+**容器启动后日志报 `bind: permission denied`（端口 440/443）**
+
+检查是否手动加了 `--security-opt no-new-privileges:true`，或启动器页面勾选了 no-new-privileges。该选项会禁用镜像内的 `CAP_NET_BIND_SERVICE` 文件能力；取消后重启容器即可。
 
 **页面一直弹登录框 / 忘记密码**
 

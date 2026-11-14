@@ -19,6 +19,10 @@ journalctl -u linkc-node -n 100
 
 数据库 schema 在启动时检查；不兼容会报错退出，不会静默修改数据库。
 
+## 配置兼容性
+
+0.10.0 起移除了已无作用的 `alive_ip.clear_offline` 字段，YAML 解析是严格的。从 0.8.x 升级时请先删除该行，否则 `linkc-node check` 会报 `field clear_offline not found`。
+
 ## 回滚
 
 ```bash

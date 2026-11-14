@@ -8,7 +8,7 @@
 
 | 控制项 | 现状 | 说明 |
 |---|---|---|
-| 专用低权用户 | ✅ `useradd --system --shell nologin linkc` | install.sh 创建系统用户，服务以 `User=linkc` 运行 |
+| 专用低权用户 | ✅ `useradd --system --shell nologin linkc` | install.sh 与 deb/rpm postinstall 创建系统用户，服务以 `User=linkc` 运行 |
 | `NoNewPrivileges=true` | ✅ | 禁止 setuid 提权链 |
 | `ProtectSystem=strict` + `ReadWritePaths` | ✅ | 只读根文件系统，仅 `/var/lib/linkc-node`、`/run/linkc-node` 可写 |
 | `ProtectHome/PrivateTmp/PrivateDevices` | ✅ | 隔离 home、/tmp、设备节点 |
@@ -19,8 +19,7 @@
 | `UMask=0077`（systemd）+ CLI 启动 `umask 077` | ✅ | 状态库/证书/key 落盘 0600 |
 | 重启策略 | ✅ `Restart=on-failure`，`StartLimitIntervalSec=0` | 崩溃后自动恢复；配合 journal 保证流量不丢（at-least-once） |
 
-**Docker**：镜像以 UID 10001 运行，推荐 `network_mode: host` + 只读根文件系统
-（见 `Dockerfile` 与 `docs/operations.md`）。
+**Docker**：镜像以 UID 10001 运行，`linkc-node` 只带 `CAP_NET_BIND_SERVICE` 文件能力（可绑定 440/443 等低端口），推荐 `network_mode: host`；`no-new-privileges` 会禁用文件能力，低端口场景需保持关闭。
 
 ## 2. 凭据与密钥
 

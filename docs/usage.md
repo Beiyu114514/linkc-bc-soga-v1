@@ -23,7 +23,7 @@ sudo dpkg -i linkc-node_<version>_amd64.deb     # 或 rpm -i
 sudo install -m 0755 linkc-node /usr/local/bin/linkc-node
 ```
 
-仓库内安装脚本会创建 `linkc` 用户、目录与 systemd unit：
+deb/rpm 安装包的 postinstall 会创建 `linkc` 用户并修正配置/状态目录权限；仓库内安装脚本也会创建用户、目录与 systemd unit：
 
 ```bash
 make build

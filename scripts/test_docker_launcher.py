@@ -202,14 +202,29 @@ class DockerCommandTest(unittest.TestCase):
         self.assertIn(f"{dl.MANAGED_LABEL}={dl.MANAGED_VALUE}", joined)
         self.assertIn(f"{self.tmp / 'etc'}:/etc/linkc-node:ro", joined)
         self.assertIn(f"{self.tmp / 'data'}:/var/lib/linkc-node", joined)
-        self.assertIn("no-new-privileges:true", joined)
+        self.assertNotIn("no-new-privileges:true", joined)
         self.assertNotIn("secret-key", joined)
+
+    def test_no_new_privileges_is_opt_in(self):
+        values = dl.normalize_values(values_with(self.tmp, no_new_privileges=True))
+        joined = " ".join(dl.docker_run_command(values, self.existing, check=False))
+        self.assertIn("no-new-privileges:true", joined)
 
     def test_run_script_has_no_secret(self):
         command = dl.docker_run_command(self.values, self.existing, check=False)
         script = dl.build_run_script(self.values, command, Path("/repo"))
         self.assertIn("set -euo pipefail", script)
         self.assertNotIn("secret-key", script)
+
+
+class WarningTest(unittest.TestCase):
+    def test_no_new_privileges_warns_about_low_ports(self):
+        tmp = Path(tempfile.mkdtemp())
+        values = dl.normalize_values(values_with(tmp, no_new_privileges=True))
+        existing = dl.existing_state(values)
+        with mock.patch.object(dl, "container_state", lambda name: {"exists": False}):
+            warnings = dl.collect_warnings(values, existing, Path("."))
+        self.assertTrue(any("no-new-privileges" in w["text"] for w in warnings))
 
 
 class EnsureOwnedDirTest(unittest.TestCase):

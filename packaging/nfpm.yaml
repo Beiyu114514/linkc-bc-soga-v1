@@ -7,6 +7,16 @@ priority: optional
 maintainer: LinkC
 description: soga-v1 VLESS node agent with embedded Xray-core
 license: UNLICENSED
+depends:
+  - passwd
+  - libc-bin
+overrides:
+  rpm:
+    depends:
+      - shadow-utils
+      - glibc-common
+scripts:
+  postinstall: packaging/postinstall.sh
 contents:
   - src: dist/linkc-node-linux-${ARCH}
     dst: /usr/local/bin/linkc-node

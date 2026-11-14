@@ -64,7 +64,9 @@ jobs:
       - name: launcher unit tests
         run: python3 -m unittest discover -s scripts -p 'test_*.py' -v
       - name: shell syntax
-        run: bash -n scripts/docker-launch.sh
+        run: |
+          bash -n scripts/docker-launch.sh
+          sh -n packaging/postinstall.sh
       - name: inline JS parses
         run: |
           node -e '

@@ -67,6 +67,7 @@ jobs:
           context: .
           platforms: ${{ github.event_name == 'pull_request' && 'linux/amd64' || 'linux/amd64,linux/arm64' }}
           push: ${{ github.event_name != 'pull_request' }}
+          load: ${{ github.event_name == 'pull_request' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           build-args: |
@@ -75,3 +76,10 @@ jobs:
             BUILD_DATE=${{ steps.date.outputs.value }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      - name: Verify low-port capability (PR)
+        if: github.event_name == 'pull_request'
+        run: |
+          image="$(printf '%s\n' "${{ steps.meta.outputs.tags }}" | head -n1)"
+          docker run --rm --user 0:0 --entrypoint getcap "$image" /usr/local/bin/linkc-node \
+            | grep -q 'cap_net_bind_service=ep'
