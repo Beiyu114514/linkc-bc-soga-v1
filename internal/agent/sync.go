@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"time"
 
 	"github.com/Beiyu114514/linkc-bc-soga-v1/internal/node"
 	"github.com/Beiyu114514/linkc-bc-soga-v1/internal/panel"
@@ -122,31 +121,45 @@ func (a *Agent) Sync(ctx context.Context) error {
 
 	if nodeCfgChanged {
 		a.collect(ctx)
-		tag := fmt.Sprintf("vless-%d", time.Now().UnixNano())
-		oldTag := engine.Tag()
-		if err := engine.AddInbound(ctx, xc, nextUsers, tag); err != nil {
-			applyErr = errors.Join(applyErr, fmt.Errorf("add inbound: %w", err))
-			a.setApplyError(err)
-			nodeUpdated = false // keep the current spec; retry next pull
-		} else {
-			if err := a.removeInbound(ctx, engine, oldTag); err != nil {
-				// The new listener is live but the old one survives; it was queued
-				// for retry so it cannot silently keep serving stale users/certs.
-				a.log.Error("remove old inbound; queued for retry", "tag", oldTag, "error", err)
-			}
+		rep, err := engine.SwapInbound(ctx, xc, nextUsers)
+		if rep.StaleTag != "" {
+			a.log.Error("inbound swap left a stale listener; queued for retry", "tag", rep.StaleTag, "error", err)
+			a.queueRemove(rep.StaleTag)
+		}
+		switch {
+		case rep.Applied:
 			engine.SetNodeSpeed(spec.Basic.SpeedLimit)
-			a.mu.Lock()
-			a.nodeSpec, a.xrayCfg = spec, xc
-			a.inboundFP = node.InboundFingerprint(xc)
-			a.users, a.usersFP = nextUsers, node.UsersFingerprint(nextUsers)
-			a.hasNode, a.hasUsers = true, true
-			a.updateIntervalsLocked(spec)
-			a.mu.Unlock()
-			a.saveNode(spec)
-			a.saveUsers(nextUsers)
+			a.commitNode(spec, xc, nextUsers)
 			usersApplied = true
 			nodeUpdated = false
-			a.log.Info("inbound applied", "port", spec.Config.Port, "tag", tag)
+			if err != nil {
+				applyErr = errors.Join(applyErr, fmt.Errorf("swap inbound: %w", err))
+				a.setApplyError(err)
+				a.log.Warn("inbound swapped with warning", "warning", rep.Warning, "error", err)
+			} else {
+				if rep.Warning != "" {
+					a.log.Warn("inbound swap warning", "warning", rep.Warning)
+				}
+				a.log.Info("inbound applied", "port", spec.Config.Port, "tag", rep.Tag)
+			}
+		case rep.RolledBack:
+			// The engine restored the previous inbound; keep agent state
+			// unchanged and retry on the next pull.
+			applyErr = errors.Join(applyErr, fmt.Errorf("swap inbound: %w", err))
+			a.setApplyError(err)
+			nodeUpdated = false
+			a.log.Warn("inbound swap rolled back", "error", err)
+		default:
+			// Add failed or there is no listener: keep the old state and retry.
+			applyErr = errors.Join(applyErr, fmt.Errorf("swap inbound: %w", err))
+			a.setApplyError(err)
+			nodeUpdated = false
+			if rep.Tag == "" {
+				a.mu.Lock()
+				a.inboundFP = ""
+				a.mu.Unlock()
+			}
+			a.log.Error("inbound swap failed; keeping previous config", "error", err)
 		}
 		a.collect(ctx)
 	}

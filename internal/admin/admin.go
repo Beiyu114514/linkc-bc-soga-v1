@@ -93,6 +93,7 @@ func metricsHandler(snapshot func() agent.Snapshot) http.HandlerFunc {
 		fmt.Fprintf(w, "# TYPE linkc_audit_hits_total counter\nlinkc_audit_hits_total %d\n", s.AuditHits)
 		fmt.Fprintf(w, "# TYPE linkc_audit_reported_total counter\nlinkc_audit_reported_total %d\n", s.AuditReported)
 		fmt.Fprintf(w, "# TYPE linkc_audit_blocked_total counter\nlinkc_audit_blocked_total %d\n", s.AuditBlocked)
+		fmt.Fprintf(w, "# TYPE linkc_audit_pending gauge\nlinkc_audit_pending %d\n", s.AuditPending)
 	}
 }
 

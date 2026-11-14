@@ -1677,11 +1677,11 @@ mock panel 必须复刻目标站点 `SogaController` 的实际行为，而不仅
 - [x] 同端口 inbound 热切换（SO_REUSEPORT）验证。
 - [~] XHTTP 参数映射已测；ECH key 未测（站点不下发 ECH）。
 - [x] 按站点 `SogaController` 复刻 mock panel：ETag/304、空 users、status.load、裸 regex、online_user、alive_ip 60s upsert。
-- [ ] 真实站点联调（需要测试节点/API key）；审计裸 regex 的真实语义仍待验证。
+- [x] 真实站点联调（2026-11-14，节点 ID 4，REALITY + Vision，证据见 `LIVE-VALIDATION.md`）；审计裸 regex 语义已由规则 23 实测确认。
 - [x] 用站点源码差量核对，主要契约已写入 §3.9。
 
 **退出标准（已达成）**：PoC 能跑通 1 个 VLESS 节点（TCP/TLS/Reality），真实客户端可连，流量/在线/状态可上报到 mock panel。
-**M0 遗留**：真实站点 `status.load` 显示、审计 regex 解释、证书来源、空 users 线上行为。
+**M0 遗留**：均已在 M2–M5 与真实站点联调中关闭（status.load 口径、审计 regex 语义、证书来源=本地文件、空 users 行为）。
 
 ### M1 · MVP（5-7 人日）— ✅ 核心完成
 
@@ -1709,27 +1709,27 @@ mock panel 必须复刻目标站点 `SogaController` 的实际行为，而不仅
 - [x] `traffic.include_online_zero`。
 
 **退出标准（已达成）**：8 个接口全部实现并通过 mock；真实站点 node/users/traffic/status/audit_rules/white_list/audit_log/alive_ip 已跑通；`status.load` 已确认；XHTTP/GRPC 实际连接通过。
-**M2 可选遗留**：ECH 实际握手（缺测试 key set）、Prometheus 告警模板。
+**M2 可选遗留**：ECH 实际握手（缺测试 key set）。
 
 ### M3 · 限额与审计执行（5-6 人日）— ✅ 核心完成
 
 - [x] 用户/节点限速；设备限制（含 IPv6 /64 聚合）；TCP 限制；enforce/report/off。
 - [x] 审计 block/report；TTL 去重；规则热更新；geosite/geoip；域名解析 IP 规则。
 - [x] 限速/审计对 splice 的影响处理；Node 全局 limiter。
-- [x] 真实站点 1 Mbps / 1 设备验收；[~] 压测与多出口 IPv6 待补。
+- [x] 真实站点 1 Mbps / 1 设备验收；[~] 多出口 IPv6 待补（10k 用户/吞吐压测已完成，见 M5）。
 
 **退出标准（已达成）**：限额执行逻辑、设备/IPv6、TCP、审计白名单/去重/geosite 已通过单元测试；真实站点低限额（1 Mbps）与设备数（1）已验证。
 
-### M4 · 加固与交付（4-5 人日）— 工程化完成
+### M4 · 加固与交付（4-5 人日）— ✅ 完成（M5 收尾）
 
-- [~] inbound 热切换：添加失败保留旧配置；旧移除失败自动回滚未完成。
-- [x] 多证书/SNI、SIGHUP 证书热加载（真实 TLS 轮换 E2E 待补）。
-- [x] 安全加固（systemd/权限/umask/输入校验/脱敏）。
-- [~] 故障注入/混沌：面板故障、非法配置、inbound 失败已覆盖；长稳未跑。
-- [x] Makefile、安装脚本、nfpm 模板、升级/回滚文档。
-- [x] 运维/FAQ/指标文档。
+- [x] inbound 热切换事务化：添加失败保留旧配置；旧移除失败自动回滚到旧 inbound（`Engine.SwapInbound`，含「新 inbound 也摘不掉」与「回滚本身失败」的兜底路径，单测覆盖 5 条分支）。
+- [x] 多证书/SNI、SIGHUP 证书热加载；真实 TLS 轮换 E2E 已补（`TestReloadCertsRotatesServingCertificate`）；顺带修复 `Spec.Xray` 丢弃 `node.tls.certificates` 的 bug（`TestSpecPassesLocalCertificates`）。
+- [x] 安全加固（systemd/权限/umask/输入校验/脱敏）；审计报告见 `docs/security-audit.md`。
+- [x] 故障注入/混沌：面板 5xx/429、webapi 503、journal 写满、端口切换、用户 churn、证书轮换均有测试；长稳 harness 就绪（`make soak`，`SOAK_DURATION=24h`）。
+- [x] Makefile、安装脚本、nfpm 模板、升级/回滚文档；deb/rpm 打包实测通过（安装/升级/卸载、权限、conffile）。
+- [x] 运维/FAQ/指标文档；Prometheus 告警规则 `deploy/alerts.yml` + `docs/monitoring.md`；新增 `linkc_audit_pending` 指标。
 
-**退出标准（部分达成）**：可部署、可运维、可备份回滚；完整回滚、真实证书轮换、deb/rpm 实测、24h 长稳仍待验收。
+**退出标准（已达成，除标注外）**：可部署、可运维、可备份回滚；完整回滚（deb/rpm 安装/升级/卸载）已实测。仍待验收：24h 长稳实跑、多域名证书真实场景、systemd 沙箱/SELinux 目标机兼容性（见 `docs/security-audit.md` S1/S2）。
 
 **总计**：约 22~28 人日（不含缓冲）。建议预留 20% 缓冲。
 
@@ -1792,18 +1792,18 @@ mock panel 必须复刻目标站点 `SogaController` 的实际行为，而不仅
 - 详细记录见 `LIVE-VALIDATION.md`。
 - 仍待确认：空 users、限额、真实面板断网、在线 IP 页面。
 
-### P0（仍需确认）
+### P0（2026-11-14 联调后仍开放）
 
-1. **部署版本**：线上站点是否与归档源码完全一致？是否有二次修改/插件？能否提供测试节点与 API key？
-2. **审计规则解释**：站点返回裸 regex（如 `.*google\.com`），真实 soga 是按 regex 还是 keyword 解释？建议先用测试规则验证；本方案默认 `auto`。
-3. **状态口径**：`load` 第一 token 是否就是 CPU 使用率（0..1），还是 load average？站点前端按 ×100 显示“负载”；需和站点确认期望值。
-4. **在线数口径**：站点在线数来自 traffic 条数，是否要求包含零流量在线用户（会写 0/0 流量日志）？默认不包含。
-5. **限额要求**：`speed_limit` / `device_limit` / `tcp_limit` 必须强制执行，还是仅上报由面板处理？强制执行会引入 Gatekeeper 复杂度。
+1. **部署版本**：线上站点是否与归档源码完全一致？是否有二次修改/插件？
+2. ~~审计规则解释~~ ✅ 已确认：站点 27 条规则全部裸 regex，`auto` 模式编译 27/27，规则 23 实测命中 `www.360.cn`。
+3. ~~状态口径~~ ✅ 已确认：`load` 第一 token 即 CPU 使用率（0..1），前端显示正确。
+4. **在线数口径**：站点在线数来自 traffic 条数，是否要求包含零流量在线用户（会写 0/0 流量日志）？默认不包含（`include_online_zero=false`）。
+5. **限额要求**：`speed_limit`/`device_limit` 强制执行已实现并验证；待确认面板侧是否还有额外口径（如超流量用户限速 1 Mbps 的展示）。
 6. **传输范围**：站点是否配置 `http`/`h2`？现代 Xray 已移除，只能拒绝或让站点改用 `xhttp`；站点也不下发 `xhttp_settings`。
-7. **证书来源**：`tls_type=tls` 时证书由本地文件、外部 ACME 工具还是其他方式？（站点不提供证书字段）
+7. **证书来源**：`tls_type=tls` 时证书由本地文件、外部 ACME 工具还是其他方式？（站点不提供证书字段；REALITY 节点不涉及）
 8. **`xtls` 配置**：站点把 `xtls` 映射为 `none`；后台是否有人这样配？建议改成 `reality` 或 `tls`。
-9. **checkNodeIp / 反代**：站点是否开启 `checkNodeIp`？节点出口 IP 是否稳定？若在反代后，`REMOTE_ADDR` 是否可信？
-10. **部署目标**：Linux only？systemd/Docker？架构？是否要 443 端口？
+9. **checkNodeIp / 反代**：实测从非节点 IP 直接 GET `/node` 成功，疑似关闭；节点在反代后时 `REMOTE_ADDR` 是否可信需确认。
+10. **部署目标**：已按 Linux + systemd 交付（deb/rpm + Docker），端口按面板下发（实测 440）；是否需要 443 由站点配置决定。
 
 ### P1
 
@@ -2002,3 +2002,4 @@ example.com;443;0;tcp;reality;sni=www.microsoft.com|flow=xtls-rprx-vision|fp=chr
 | v0.7 | 2026-11-14 | M3 核心完成：节点全局限速、IPv6 /64 设备聚合、TCP/report/off、geosite/geoip、域名解析 IP 规则、限额指标；报告见 `M3-REPORT.md` |
 | v0.7.1 | 2026-11-14 | M3 验收：真实站点 1 Mbps/1 设备通过；修复 inbound 热切换 oldTag 误删新 tag、ETag 304 与 last_good 不一致；新增回归测试 |
 | v0.8 | 2026-11-14 | M4 工程化：多证书/SNI、SIGHUP 证书重载、systemd 加固、Makefile/安装脚本/nfpm、升级回滚/FAQ 文档；报告见 `M4-REPORT.md` |
+| v0.9 | 2026-11-14 | M5 收尾：inbound 热切换事务化回滚（`Engine.SwapInbound` + 5 分支单测）；真实 TLS 证书轮换 E2E；修复 `Spec.Xray` 丢弃多证书的 bug；多证书 SNI E2E；混沌测试（面板 5xx/429、503、journal 写满）；10k 用户/吞吐压测与 benchmark；soak harness（`make soak`）；deb/rpm 打包实测；`deploy/alerts.yml` + `docs/monitoring.md` + `docs/security-audit.md`；新增 `linkc_audit_pending` 指标；报告见 `M5-REPORT.md` |

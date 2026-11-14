@@ -2,9 +2,17 @@ package node
 
 import (
 	"bytes"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/base64"
+	"encoding/pem"
+	"math/big"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/Beiyu114514/linkc-bc-soga-v1/internal/panel"
 	"github.com/Beiyu114514/linkc-bc-soga-v1/internal/xray"
@@ -142,4 +150,55 @@ func TestSpecExtendedFields(t *testing.T) {
 	if xc.XHTTP == nil || xc.XHTTP.Path != "/new" || xc.XHTTP.Mode != "packet-up" || xc.Decryption != "none" {
 		t.Fatalf("xhttp = %+v", xc.XHTTP)
 	}
+}
+
+func TestSpecPassesLocalCertificates(t *testing.T) {
+	// Regression: multi-certificate configs (node.tls.certificates) must
+	// reach the Xray config; dropping them silently disables SNI selection.
+	certA, keyA := testCertPair(t, "a.test")
+	certB, keyB := testCertPair(t, "b.test")
+	s := Spec{
+		NodeType: "vless",
+		Config:   panel.Config{Port: 443, StreamType: "tcp", TLSType: "tls"},
+	}
+	xc, err := s.Xray(LocalRuntime{Listen: "127.0.0.1", Certificates: []xray.TLSCertificate{
+		{CertPEM: certA, KeyPEM: keyA},
+		{CertPEM: certB, KeyPEM: keyB},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(xc.Certificates) != 2 {
+		t.Fatalf("certificates = %d, want 2", len(xc.Certificates))
+	}
+	if xc.Certificates[0].CertPEM != certA || xc.Certificates[1].CertPEM != certB {
+		t.Fatal("certificate order not preserved")
+	}
+}
+
+func testCertPair(t *testing.T, dnsName string) (certPEM, keyPEM string) {
+	t.Helper()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tmpl := &x509.Certificate{
+		SerialNumber: big.NewInt(time.Now().UnixNano()),
+		Subject:      pkix.Name{CommonName: dnsName},
+		DNSNames:     []string{dnsName},
+		NotBefore:    time.Now().Add(-time.Hour),
+		NotAfter:     time.Now().Add(24 * time.Hour),
+		KeyUsage:     x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	keyDER, err := x509.MarshalECPrivateKey(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})),
+		string(pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER}))
 }
