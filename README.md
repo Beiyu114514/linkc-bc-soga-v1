@@ -11,6 +11,7 @@
 
 ## 文档
 
+- [docs/usage.md](./docs/usage.md)：**使用文档**（安装 → 配置 → 启动验证 → 常用操作 → 排障）
 - [PLAN.md](./PLAN.md)：总体技术规划（v0.9）
 - [M0-REPORT.md](./M0-REPORT.md)：技术验证结果
 - [M1-REPORT.md](./M1-REPORT.md)：MVP 实现、测试与遗留
@@ -20,6 +21,7 @@
 - [M5-REPORT.md](./M5-REPORT.md)：收尾：回滚事务/证书 E2E/混沌/压测/打包/告警
 - [LIVE-VALIDATION.md](./LIVE-VALIDATION.md)：真实站点联调记录
 - [docs/configuration.md](./docs/configuration.md)：配置说明
+- [docs/docker-launcher.md](./docs/docker-launcher.md)：Docker 一键启动（图形化参数页）
 - [docs/operations.md](./docs/operations.md)：部署/运维
 - [docs/monitoring.md](./docs/monitoring.md)：指标、抓取与告警（`deploy/alerts.yml`）
 - [docs/security-audit.md](./docs/security-audit.md)：安全审计
@@ -66,6 +68,28 @@ go build -trimpath -o linkc-node ./cmd/linkc-node
 Xray 版本固定为 release `v26.11.9` 的 commit 伪版本：
 `v1.260327.1-0.20261109052709-676eaf66f8f0`
 （GitHub tag `v26.11.9` 不是合法 Go module semver）。
+
+## Docker 一键启动（图形化）
+
+```bash
+# 默认监听 0.0.0.0；自动生成并打印页面密码
+sudo ./scripts/docker-launch.sh --username admin
+
+# 仅本机访问
+sudo ./scripts/docker-launch.sh --bind 127.0.0.1
+
+# 用哈希文件（不保存明文）
+sudo ./scripts/docker-launch.sh --hash-password --hash-password-output /root/.linkc-node/password.hash
+sudo ./scripts/docker-launch.sh --username admin --password-hash-file /root/.linkc-node/password.hash
+```
+
+脚本会在本机启动一个带随机 token 的图形化参数页，填写面板地址、API Key、节点 ID 后自动生成
+`config.yaml` / `api-key` / 证书 / `docker-run.sh` 并启动容器。默认使用 host 网络，页面监听
+`0.0.0.0`；**监听 `0.0.0.0` 时必须加 `--username` 启用登录**，否则启动器拒绝启动；仅本机用 `--bind 127.0.0.1`。
+加 `--username` 会自动生成随机密码并打印，同时写入 0600 JSON 凭据文件（默认
+`~/.linkc-node/launcher-credentials.json`）；`--ask-password` 可手动输入，`--password-hash-file`
+可读取 scrypt 哈希文件（不保存明文）。非 root 运行时使用
+`~/.linkc-node`。详细说明见 [docs/docker-launcher.md](./docs/docker-launcher.md)。
 
 ## 快速检查 / 运行
 
