@@ -6,7 +6,6 @@ import (
 	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -275,7 +274,7 @@ func (c *Client) get(ctx context.Context, path string) ([]byte, bool, error) {
 	var cached store.ETagRecord
 	haveCache := false
 	if c.cache != nil {
-		rec, ok, err := c.cache.GetETag(path)
+		rec, ok, err := c.cache.GetETag(c.cacheKey(path))
 		if err != nil {
 			return nil, false, err
 		}
@@ -333,7 +332,7 @@ func (c *Client) getOnce(ctx context.Context, path string, cached store.ETagReco
 		}
 		if c.cache != nil {
 			cached.FetchedAt = time.Now()
-			_ = c.cache.PutETag(path, cached)
+			_ = c.cache.PutETag(c.cacheKey(path), cached)
 		}
 		return cached.Body, false, false, nil
 	case resp.StatusCode == http.StatusOK:
@@ -352,7 +351,7 @@ func (c *Client) getOnce(ctx context.Context, path string, cached store.ETagReco
 			FetchedAt: time.Now(),
 		}
 		if c.cache != nil {
-			if err := c.cache.PutETag(path, rec); err != nil {
+			if err := c.cache.PutETag(c.cacheKey(path), rec); err != nil {
 				return nil, false, false, fmt.Errorf("panel %s: cache write: %w", path, err)
 			}
 		}
@@ -394,7 +393,7 @@ func (c *Client) getOnceUnconditional(ctx context.Context, path string) ([]byte,
 	}
 	rec := store.ETagRecord{ETag: resp.Header.Get("ETag"), Body: b, FetchedAt: time.Now()}
 	if c.cache != nil {
-		_ = c.cache.PutETag(path, rec)
+		_ = c.cache.PutETag(c.cacheKey(path), rec)
 	}
 	return b, true, false, nil
 }
@@ -431,6 +430,15 @@ func (c *Client) postJSON(ctx context.Context, path string, payload any) error {
 		return fmt.Errorf("panel %s: code %d: %s", path, result.Code, result.Message)
 	}
 	return nil
+}
+
+func (c *Client) cacheKey(path string) string {
+	if c.cfg.NodeID == "" {
+		return path
+	}
+	// Scope the cache to the node so changing panel.node_id cannot replay
+	// another node's cached body via a 304.
+	return c.cfg.NodeID + "|" + path
 }
 
 func (c *Client) setHeaders(req *http.Request) {
@@ -473,10 +481,4 @@ func sleep(ctx context.Context, d time.Duration) bool {
 	case <-t.C:
 		return true
 	}
-}
-
-// hashBody is kept for tests/debugging; the ETag cache also stores SHA-256.
-func hashBody(b []byte) string {
-	h := sha256.Sum256(b)
-	return hex.EncodeToString(h[:])
 }

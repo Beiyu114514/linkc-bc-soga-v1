@@ -118,6 +118,15 @@ func ValidateConfig(node NodeConfig) error {
 			return fmt.Errorf("invalid ECH server keys base64: %w", err)
 		}
 	}
+	if node.MLDSA65Seed != "" {
+		if tlsType != "reality" {
+			return fmt.Errorf("mldsa65_seed requires tls_type=reality")
+		}
+		seed, err := base64.RawURLEncoding.DecodeString(node.MLDSA65Seed)
+		if err != nil || len(seed) != 32 {
+			return fmt.Errorf("invalid reality mldsa65_seed (want base64url-encoded 32 bytes)")
+		}
+	}
 	if dec := strings.TrimSpace(node.Decryption); dec != "" {
 		if len(dec) > 256 || strings.ContainsAny(dec, "\x00\r\n \t") {
 			return fmt.Errorf("invalid VLESS decryption value")

@@ -62,8 +62,10 @@ type NodeConfig struct {
 	MinVersion    string
 	ECHServerKeys string
 	Decryption    string
-	XHTTP         *XHTTPConfig
-	GRPC          *GRPCConfig
+	// MLDSA65Seed is an optional REALITY ML-DSA-65 seed (base64 RawURL, 32 bytes).
+	MLDSA65Seed string
+	XHTTP       *XHTTPConfig
+	GRPC        *GRPCConfig
 
 	// Client-side fields are used by E2E tests only.
 	PinnedPeerCertSha256 string
@@ -629,6 +631,9 @@ func buildStream(node NodeConfig) (map[string]any, error) {
 			"shortIds":    node.ShortIDs,
 			"xver":        node.XVER,
 		}
+		if node.MLDSA65Seed != "" {
+			reality["mldsa65Seed"] = node.MLDSA65Seed
+		}
 		stream["realitySettings"] = reality
 	default:
 		return nil, fmt.Errorf("unsupported tls_type %q", node.TLSType)
@@ -1004,10 +1009,8 @@ func (r *rateReader) ReadMultiBuffer() (buf.MultiBuffer, error) {
 	if err != nil || mb.IsEmpty() {
 		return mb, err
 	}
-	for _, lim := range r.lims {
-		if err := lim.WaitN(r.ctx, int(mb.Len())); err != nil {
-			return mb, err
-		}
+	if err := waitLimits(r.ctx, r.lims, int(mb.Len())); err != nil {
+		return mb, err
 	}
 	return mb, nil
 }
@@ -1020,11 +1023,31 @@ type rateWriter struct {
 
 func (w *rateWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
 	if !mb.IsEmpty() {
-		for _, lim := range w.lims {
-			if err := lim.WaitN(w.ctx, int(mb.Len())); err != nil {
-				return err
-			}
+		if err := waitLimits(w.ctx, w.lims, int(mb.Len())); err != nil {
+			return err
 		}
 	}
 	return w.w.WriteMultiBuffer(mb)
+}
+
+// waitLimits applies every limiter to n bytes. rate.Limiter.WaitN rejects n
+// larger than the burst, so large buffers are consumed in burst-sized chunks.
+func waitLimits(ctx context.Context, lims []*rate.Limiter, n int) error {
+	for _, lim := range lims {
+		burst := lim.Burst()
+		if burst <= 0 {
+			burst = n
+		}
+		for remaining := n; remaining > 0; {
+			chunk := remaining
+			if chunk > burst {
+				chunk = burst
+			}
+			if err := lim.WaitN(ctx, chunk); err != nil {
+				return err
+			}
+			remaining -= chunk
+		}
+	}
+	return nil
 }

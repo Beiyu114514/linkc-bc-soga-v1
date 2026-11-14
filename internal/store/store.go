@@ -110,6 +110,20 @@ func Open(path string) (*Store, error) {
 	return s, nil
 }
 
+// OpenReadOnly opens an existing state database without creating or migrating
+// it. It still takes bbolt's shared lock, so a live read-write agent will make
+// this time out; callers should treat a failure as "no cache available".
+func OpenReadOnly(path string) (*Store, error) {
+	if path == "" {
+		return nil, fmt.Errorf("store: empty path")
+	}
+	db, err := bolt.Open(path, 0o600, &bolt.Options{Timeout: 500 * time.Millisecond, ReadOnly: true})
+	if err != nil {
+		return nil, fmt.Errorf("store: open read-only %s: %w", path, err)
+	}
+	return &Store{db: db, path: path}, nil
+}
+
 func (s *Store) init() error {
 	return s.db.Update(func(tx *bolt.Tx) error {
 		for _, name := range [][]byte{bucketMeta, bucketETag, bucketLastGood, bucketTraffic, bucketTrafficMeta, bucketAudit, bucketAuditMeta, bucketAuditDedup} {

@@ -107,3 +107,29 @@ func TestReopenPersists(t *testing.T) {
 		t.Fatalf("pending after reopen = %+v err=%v", pending, err)
 	}
 }
+
+func TestOpenReadOnly(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.db")
+	s, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.PutLastGood("k", map[string]int{"a": 1}); err != nil {
+		t.Fatal(err)
+	}
+	_ = s.Close()
+
+	ro, err := OpenReadOnly(path)
+	if err != nil {
+		t.Fatalf("OpenReadOnly: %v", err)
+	}
+	defer ro.Close()
+	var v map[string]int
+	ok, err := ro.GetLastGood("k", &v)
+	if err != nil || !ok || v["a"] != 1 {
+		t.Fatalf("read-only GetLastGood ok=%v v=%v err=%v", ok, v, err)
+	}
+	if _, err := OpenReadOnly(filepath.Join(t.TempDir(), "missing.db")); err == nil {
+		t.Fatal("expected error opening missing DB read-only")
+	}
+}

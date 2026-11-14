@@ -89,6 +89,10 @@ type Agent struct {
 
 	applyMu   sync.Mutex
 	collectMu sync.Mutex
+
+	// pendingRemove holds inbound tags whose removal failed and must be
+	// retried, otherwise a stale listener could keep serving old users/certs.
+	pendingRemove []string
 }
 
 // New opens the store and panel client. Run performs the first bootstrap.
@@ -165,23 +169,23 @@ func (a *Agent) Bootstrap(ctx context.Context) error {
 	defer a.applyMu.Unlock()
 
 	var rawNode panel.Node
-	haveNode, err := a.store.GetLastGood("node", &rawNode)
+	haveNode, err := a.store.GetLastGood(a.lastGood("node"), &rawNode)
 	if err != nil {
 		return err
 	}
 	var rawUsers []panel.User
-	haveUsers, err := a.store.GetLastGood("users", &rawUsers)
+	haveUsers, err := a.store.GetLastGood(a.lastGood("users"), &rawUsers)
 	if err != nil {
 		return err
 	}
 
 	var rawRules []panel.AuditRule
-	haveRules, err := a.store.GetLastGood("audit_rules", &rawRules)
+	haveRules, err := a.store.GetLastGood(a.lastGood("audit_rules"), &rawRules)
 	if err != nil {
 		return err
 	}
 	var rawWhite []string
-	haveWhite, err := a.store.GetLastGood("white_list", &rawWhite)
+	haveWhite, err := a.store.GetLastGood(a.lastGood("white_list"), &rawWhite)
 	if err != nil {
 		return err
 	}
@@ -227,12 +231,12 @@ func (a *Agent) Bootstrap(ctx context.Context) error {
 			}
 		}
 		if haveRules {
-			if err := a.store.PutLastGood("audit_rules", rawRules); err != nil {
+			if err := a.store.PutLastGood(a.lastGood("audit_rules"), rawRules); err != nil {
 				a.log.Warn("save last_good audit_rules", "error", err)
 			}
 		}
 		if haveWhite {
-			if err := a.store.PutLastGood("white_list", rawWhite); err != nil {
+			if err := a.store.PutLastGood(a.lastGood("white_list"), rawWhite); err != nil {
 				a.log.Warn("save last_good white_list", "error", err)
 			}
 		}
@@ -382,23 +386,15 @@ func (a *Agent) userOptions() node.UserOptions {
 func (a *Agent) localRuntime() node.LocalRuntime { return a.localRuntimeWith(a.certs) }
 
 func (a *Agent) localRuntimeWith(certs []xray.TLSCertificate) node.LocalRuntime {
-	return node.LocalRuntime{
-		Listen:           a.cfg.Node.Listen,
-		Certificates:     append([]xray.TLSCertificate(nil), certs...),
-		AllowPrivate:     a.cfg.Node.Freedom.AllowPrivateTargets,
-		Sniffing:         a.cfg.Node.Sniffing.Mode != "off",
-		LimitsMode:       a.cfg.Node.Limits.Mode,
-		BurstBytes:       a.cfg.Node.Limits.BurstBytes,
-		DeviceIPv6Prefix: a.cfg.Node.Limits.DeviceLimitIPv6Prefix,
-		ALPN:             a.cfg.Node.TLS.ALPN,
-		MinVersion:       a.cfg.Node.TLS.MinVersion,
-		ECHServerKeys:    a.cfg.Node.TLS.ECHServerKeys,
-		Decryption:       a.cfg.Node.VLESS.Decryption,
-		XHTTP:            localXHTTP(a.cfg.Node.XHTTP),
-		GRPC:             localGRPC(a.cfg.Node.GRPC),
-		Audit:            a.auditHook(),
-	}
+	return node.LocalRuntimeFromConfig(a.cfg, certs, a.auditHook())
 }
+
+// LastGoodKey scopes a persisted last-good object to the panel node so that
+// changing panel.node_id on the same state DB cannot replay another node's
+// cached config.
+func LastGoodKey(nodeID, kind string) string { return nodeID + "|" + kind }
+
+func (a *Agent) lastGood(kind string) string { return LastGoodKey(a.cfg.Panel.NodeID, kind) }
 
 // ReloadCerts re-reads certificate files and hot-swaps the inbound when the
 // inline material changed. SIGHUP calls this.
@@ -419,6 +415,7 @@ func (a *Agent) ReloadCerts() error {
 		a.certs = certs
 		return nil
 	}
+	a.flushPendingRemove(context.Background(), engine)
 	if sameCerts(a.certs, certs) {
 		return nil
 	}
@@ -438,8 +435,8 @@ func (a *Agent) ReloadCerts() error {
 		a.collect(context.Background())
 		return fmt.Errorf("reload certs: add inbound: %w", err)
 	}
-	if err := engine.RemoveInbound(context.Background(), oldTag); err != nil {
-		a.log.Warn("reload certs: remove old inbound", "tag", oldTag, "error", err)
+	if err := a.removeInbound(context.Background(), engine, oldTag); err != nil {
+		a.log.Error("reload certs: remove old inbound; queued for retry", "tag", oldTag, "error", err)
 	}
 	a.certs = certs
 	a.mu.Lock()
@@ -463,21 +460,50 @@ func sameCerts(a, b []xray.TLSCertificate) bool {
 	return true
 }
 
-func localXHTTP(c config.XHTTPConfig) *xray.XHTTPConfig {
-	if c.Host == "" && c.Path == "" && c.Mode == "" && len(c.Headers) == 0 {
-		return nil
-	}
-	return &xray.XHTTPConfig{Host: c.Host, Path: c.Path, Mode: c.Mode, Headers: c.Headers}
+const maxRemoveRetries = 3
+
+func isNotFound(err error) bool {
+	return err == nil || strings.Contains(strings.ToLower(err.Error()), "not found")
 }
 
-func localGRPC(c config.GRPCConfig) *xray.GRPCConfig {
-	if c.Authority == "" && c.ServiceName == "" && !c.MultiMode && c.IdleTimeout == 0 &&
-		c.HealthCheckTimeout == 0 && !c.PermitWithoutStream && c.InitialWindowsSize == 0 && c.UserAgent == "" {
-		return nil
+// removeInbound removes an inbound, retrying transient failures. If removal
+// keeps failing the tag is queued so the stale listener is cleaned up later
+// instead of silently serving old users/certs.
+func (a *Agent) removeInbound(ctx context.Context, engine *xray.Engine, tag string) error {
+	var err error
+	for attempt := 0; attempt < maxRemoveRetries; attempt++ {
+		if err = engine.RemoveInbound(ctx, tag); isNotFound(err) {
+			return nil
+		}
+		if attempt < maxRemoveRetries-1 {
+			if !sleepCtx(ctx, time.Duration(100*(attempt+1))*time.Millisecond) {
+				break
+			}
+		}
 	}
-	return &xray.GRPCConfig{Authority: c.Authority, ServiceName: c.ServiceName, MultiMode: c.MultiMode,
-		IdleTimeout: c.IdleTimeout, HealthCheckTimeout: c.HealthCheckTimeout,
-		PermitWithoutStream: c.PermitWithoutStream, InitialWindowsSize: c.InitialWindowsSize, UserAgent: c.UserAgent}
+	a.mu.Lock()
+	a.pendingRemove = append(a.pendingRemove, tag)
+	a.mu.Unlock()
+	return err
+}
+
+// flushPendingRemove retries queued inbound removals.
+func (a *Agent) flushPendingRemove(ctx context.Context, engine *xray.Engine) {
+	a.mu.Lock()
+	pending := a.pendingRemove
+	a.pendingRemove = nil
+	a.mu.Unlock()
+	var keep []string
+	for _, tag := range pending {
+		if err := engine.RemoveInbound(ctx, tag); !isNotFound(err) {
+			keep = append(keep, tag)
+		}
+	}
+	if len(keep) > 0 {
+		a.mu.Lock()
+		a.pendingRemove = append(a.pendingRemove, keep...)
+		a.mu.Unlock()
+	}
 }
 
 // auditHook returns a nil interface when audit is disabled, avoiding a typed
@@ -500,7 +526,7 @@ func (a *Agent) updateIntervalsLocked(spec node.Spec) {
 
 func (a *Agent) saveNode(spec node.Spec) {
 	pn := a.specPanel(spec)
-	if err := a.store.PutLastGood("node", pn); err != nil {
+	if err := a.store.PutLastGood(a.lastGood("node"), pn); err != nil {
 		a.log.Warn("save last_good node", "error", err)
 	}
 }
@@ -510,7 +536,7 @@ func (a *Agent) saveUsers(users []xray.User) {
 	for _, u := range users {
 		pu = append(pu, panel.User{ID: u.ID, UUID: u.UUID, SpeedLimit: u.SpeedLimit, DeviceLimit: u.DeviceLimit, TCPLimit: u.TCPLimit})
 	}
-	if err := a.store.PutLastGood("users", pu); err != nil {
+	if err := a.store.PutLastGood(a.lastGood("users"), pu); err != nil {
 		a.log.Warn("save last_good users", "error", err)
 	}
 }
@@ -520,6 +546,16 @@ func (a *Agent) recordSuccess(endpoint string) {
 	defer a.mu.Unlock()
 	a.failures[endpoint] = 0
 	a.lastOK[endpoint] = time.Now()
+	allOK := true
+	for _, n := range a.failures {
+		if n > 0 {
+			allOK = false
+			break
+		}
+	}
+	if allOK {
+		a.lastErr = nil
+	}
 	a.updateDegradedLocked()
 }
 
@@ -767,9 +803,6 @@ func (a *Agent) OnlineIPs() map[int64][]string {
 	}
 	return e.OnlineIPs()
 }
-
-// PoolName is a tiny helper for tests/logging.
-func (a *Agent) PoolName() string { return strings.TrimSpace(a.cfg.Panel.NodeID) }
 
 func newAuditChecker(st *store.Store, cfg config.Config, log *slog.Logger) *audit.Checker {
 	if !cfg.Node.Audit.Enabled {

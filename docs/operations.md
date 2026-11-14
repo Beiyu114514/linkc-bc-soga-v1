@@ -117,8 +117,9 @@ curl --unix-socket /run/linkc-node/admin.sock http://localhost/metrics
 
 ## 仍限制
 
-- `geosite:` / `geoip:` 规则尚未接入（跳过并告警）。
-- ECH、decryption、XHTTP/GRPC 完整参数尚未实现。
-- 多证书（按 SNI）暂不支持，MVP 一张证书。
+- `inbound` 切换后若旧 tag 移除持续失败，会退化为“双监听”：新连接按 `SO_REUSEPORT` 分配，旧监听持有旧用户/证书。代码已对移除做重试并排队遗留 tag，但尚无完整事务回滚。
+- ECH 实际握手未做端到端验证（缺合法测试 key set）。
+- geosite 属性（`@cn` 等）与 `geoip` reverse 语义未实现。
 - 审计依赖 sniffing；纯 IP、ECH/ESNI、HTTP/3 可能看不到域名。
-- `dump-config` 仅用于排查，不要直接作为生产配置启动。
+- `dump-config` 仅用于排查：服务运行中无法读取 state DB，会退化为仅访问面板。
+- 长稳/混沌/10k 压测、Prometheus 告警模板、deb/rpm 实测仍待补。

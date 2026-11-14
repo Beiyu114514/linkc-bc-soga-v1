@@ -171,9 +171,8 @@ type TrafficConfig struct {
 }
 
 type AliveIPConfig struct {
-	Mode         string `yaml:"mode"` // changed | full
-	FullEvery    int    `yaml:"full_every"`
-	ClearOffline bool   `yaml:"clear_offline"`
+	Mode      string `yaml:"mode"` // changed | full
+	FullEvery int    `yaml:"full_every"`
 }
 
 type StatusConfig struct {
@@ -181,8 +180,7 @@ type StatusConfig struct {
 }
 
 type GeodataConfig struct {
-	Dir        string `yaml:"dir"`
-	AutoUpdate bool   `yaml:"auto_update"`
+	Dir string `yaml:"dir"`
 }
 
 type StorageConfig struct {
@@ -240,12 +238,19 @@ func Load(path string) (Config, error) {
 	if err != nil {
 		return Config{}, fmt.Errorf("read config: %w", err)
 	}
-	raw, err = expandEnv(raw)
-	if err != nil {
+	var root yaml.Node
+	if err := yaml.Unmarshal(raw, &root); err != nil {
+		return Config{}, fmt.Errorf("parse config: %w", err)
+	}
+	if err := expandNode(&root); err != nil {
 		return Config{}, err
 	}
+	normalized, err := yaml.Marshal(&root)
+	if err != nil {
+		return Config{}, fmt.Errorf("parse config: %w", err)
+	}
 	c := Default()
-	dec := yaml.NewDecoder(bytes.NewReader(raw))
+	dec := yaml.NewDecoder(bytes.NewReader(normalized))
 	dec.KnownFields(true)
 	if err := dec.Decode(&c); err != nil {
 		return Config{}, fmt.Errorf("parse config: %w", err)
@@ -419,6 +424,12 @@ func (c Config) Validate() error {
 	if c.Node.Traffic.BatchUsers > 500 {
 		return fmt.Errorf("node.traffic.batch_users must be <= 500")
 	}
+	if c.Node.Traffic.BatchBytes <= 0 || c.Node.Traffic.BatchBytes > 1<<30 {
+		return fmt.Errorf("node.traffic.batch_bytes must be in (0, 1GiB]")
+	}
+	if c.Storage.MaxJournalBytes <= 0 {
+		return fmt.Errorf("storage.max_journal_bytes must be > 0")
+	}
 	if c.Logging.Level != "debug" && c.Logging.Level != "info" && c.Logging.Level != "warn" && c.Logging.Level != "error" {
 		return fmt.Errorf("logging.level must be debug|info|warn|error")
 	}
@@ -432,9 +443,6 @@ func (c Config) Validate() error {
 func (c Config) Check() error {
 	if err := c.Validate(); err != nil {
 		return err
-	}
-	if err := os.MkdirAll(c.Storage.Path, 0o700); err != nil {
-		return fmt.Errorf("create storage dir: %w", err)
 	}
 	for _, p := range []string{c.Panel.TLS.CAFile, c.Panel.TLS.ClientCertFile, c.Panel.TLS.ClientKeyFile} {
 		if p != "" {
@@ -477,8 +485,49 @@ func (c Config) Check() error {
 // StateDBPath returns the bbolt path.
 func (c Config) StateDBPath() string { return filepath.Join(c.Storage.Path, "state.db") }
 
-func expandEnv(raw []byte) ([]byte, error) {
-	s := string(raw)
+func expandNode(n *yaml.Node) error {
+	if n == nil {
+		return nil
+	}
+	if n.Kind == yaml.ScalarNode {
+		if strings.Contains(n.Value, "${") {
+			v, err := expandString(n.Value)
+			if err != nil {
+				return err
+			}
+			setScalar(n, v)
+		}
+		return nil
+	}
+	for _, c := range n.Content {
+		if err := expandNode(c); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// setScalar writes an expanded value while preserving YAML typing: quoted
+// scalars stay strings; unquoted placeholders may become ints/bools; anything
+// ambiguous is forced to a safely quoted string.
+func setScalar(n *yaml.Node, v string) {
+	if n.Style == yaml.DoubleQuotedStyle || n.Style == yaml.SingleQuotedStyle ||
+		n.Style == yaml.LiteralStyle || n.Style == yaml.FoldedStyle {
+		n.Value = v
+		n.Tag = "!!str"
+		return
+	}
+	var tmp yaml.Node
+	if err := yaml.Unmarshal([]byte(v), &tmp); err == nil && len(tmp.Content) == 1 && tmp.Content[0].Kind == yaml.ScalarNode {
+		n.Tag, n.Style = tmp.Content[0].Tag, tmp.Content[0].Style
+	} else {
+		n.Tag, n.Style = "!!str", yaml.DoubleQuotedStyle
+	}
+	n.Value = v
+}
+
+// expandString replaces ${NAME} placeholders in a single scalar.
+func expandString(s string) (string, error) {
 	var out strings.Builder
 	for {
 		i := strings.Index(s, "${")
@@ -489,15 +538,15 @@ func expandEnv(raw []byte) ([]byte, error) {
 		out.WriteString(s[:i])
 		j := strings.Index(s[i+2:], "}")
 		if j < 0 {
-			return nil, fmt.Errorf("unterminated environment variable in config")
+			return "", fmt.Errorf("unterminated environment variable in config")
 		}
 		name := s[i+2 : i+2+j]
 		val, ok := os.LookupEnv(name)
 		if !ok {
-			return nil, fmt.Errorf("environment variable %s is not set", name)
+			return "", fmt.Errorf("environment variable %s is not set", name)
 		}
 		out.WriteString(val)
 		s = s[i+2+j+1:]
 	}
-	return []byte(out.String()), nil
+	return out.String(), nil
 }

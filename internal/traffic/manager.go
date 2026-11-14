@@ -177,13 +177,6 @@ func (m *Manager) PendingBytes() int64 {
 	return n
 }
 
-// LastError returns the most recent journal/push error.
-func (m *Manager) LastError() error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	return m.lastErr
-}
-
 func (m *Manager) setErr(err error) {
 	m.mu.Lock()
 	m.lastErr = err

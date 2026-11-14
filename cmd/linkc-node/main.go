@@ -126,7 +126,7 @@ func runAgent(path string) error {
 	}()
 	var adm *admin.Server
 	if cfg.Admin.Socket != "" {
-		adm, err = admin.Start(cfg.Admin.Socket, a.Snapshot)
+		adm, err = admin.Start(cfg.Admin.Socket, a.Snapshot, admin.Options{Metrics: cfg.Admin.Metrics, Pprof: cfg.Admin.Pprof})
 		if err != nil {
 			return err
 		}
@@ -144,11 +144,22 @@ func dumpConfig(path string) error {
 	if err := cfg.Check(); err != nil {
 		return err
 	}
-	st, err := store.Open(cfg.StateDBPath())
-	if err != nil {
-		return err
+	var st *store.Store
+	var cache panel.Cache
+	// Try to reuse last_good from the state DB. A running agent holds the
+	// bbolt write lock, so a failed read-only open is expected and we simply
+	// fall back to fetching everything from the panel.
+	if _, statErr := os.Stat(cfg.StateDBPath()); statErr == nil {
+		if s, openErr := store.OpenReadOnly(cfg.StateDBPath()); openErr == nil {
+			st = s
+			defer st.Close()
+			cache = st
+		}
 	}
-	defer st.Close()
+	ua := cfg.Panel.UserAgent
+	if ua == "" || ua == "linkc-node/dev" {
+		ua = version.UserAgent()
+	}
 	pc, err := panel.New(panel.Options{
 		BaseURL: cfg.Panel.BaseURL, APIKey: cfg.Panel.APIKey, NodeID: cfg.Panel.NodeID,
 		NodeType: cfg.Panel.NodeType, Timeout: cfg.Panel.Timeout.Duration(),
@@ -156,8 +167,8 @@ func dumpConfig(path string) error {
 		ServerName: cfg.Panel.TLS.ServerName, ClientCertFile: cfg.Panel.TLS.ClientCertFile,
 		ClientKeyFile: cfg.Panel.TLS.ClientKeyFile, AllowHTTP: cfg.Panel.AllowHTTP,
 		Proxy: cfg.Panel.Proxy, MaxResponseSize: cfg.Panel.MaxResponseSize,
-		MaxAttempts: cfg.Panel.MaxAttempts, UserAgent: cfg.Panel.UserAgent,
-	}, st)
+		MaxAttempts: cfg.Panel.MaxAttempts, UserAgent: ua,
+	}, cache)
 	if err != nil {
 		return err
 	}
@@ -165,13 +176,17 @@ func dumpConfig(path string) error {
 	ctx := context.Background()
 	if n, _, err := pc.FetchNode(ctx); err == nil {
 		pn = n
-	} else if ok, _ := st.GetLastGood("node", &pn); !ok {
+	} else if st == nil {
+		return fmt.Errorf("fetch node: %w", err)
+	} else if ok, _ := st.GetLastGood(agent.LastGoodKey(cfg.Panel.NodeID, "node"), &pn); !ok {
 		return fmt.Errorf("fetch node: %w", err)
 	}
 	var pu []panel.User
 	if u, _, err := pc.FetchUsers(ctx); err == nil {
 		pu = u
-	} else if ok, _ := st.GetLastGood("users", &pu); !ok {
+	} else if st == nil {
+		return fmt.Errorf("fetch users: %w", err)
+	} else if ok, _ := st.GetLastGood(agent.LastGoodKey(cfg.Panel.NodeID, "users"), &pu); !ok {
 		return fmt.Errorf("fetch users: %w", err)
 	}
 	spec, err := node.FromPanel(pn)
@@ -182,12 +197,7 @@ func dumpConfig(path string) error {
 	if err != nil {
 		return err
 	}
-	xc, err := spec.Xray(node.LocalRuntime{
-		Listen: cfg.Node.Listen, Certificates: certs,
-		AllowPrivate: cfg.Node.Freedom.AllowPrivateTargets,
-		Sniffing:     cfg.Node.Sniffing.Mode != "off",
-		LimitsMode:   cfg.Node.Limits.Mode, BurstBytes: cfg.Node.Limits.BurstBytes,
-	})
+	xc, err := spec.Xray(node.LocalRuntimeFromConfig(cfg, certs, nil))
 	if err != nil {
 		return err
 	}
@@ -228,29 +238,12 @@ func loadCerts(cfg config.Config) ([]xray.TLSCertificate, error) {
 	return out, nil
 }
 
-func localXHTTP(c config.XHTTPConfig) *xray.XHTTPConfig {
-	if c.Host == "" && c.Path == "" && c.Mode == "" && len(c.Headers) == 0 {
-		return nil
-	}
-	return &xray.XHTTPConfig{Host: c.Host, Path: c.Path, Mode: c.Mode, Headers: c.Headers}
-}
-
-func localGRPC(c config.GRPCConfig) *xray.GRPCConfig {
-	if c.Authority == "" && c.ServiceName == "" && !c.MultiMode && c.IdleTimeout == 0 &&
-		c.HealthCheckTimeout == 0 && !c.PermitWithoutStream && c.InitialWindowsSize == 0 && c.UserAgent == "" {
-		return nil
-	}
-	return &xray.GRPCConfig{Authority: c.Authority, ServiceName: c.ServiceName, MultiMode: c.MultiMode,
-		IdleTimeout: c.IdleTimeout, HealthCheckTimeout: c.HealthCheckTimeout,
-		PermitWithoutStream: c.PermitWithoutStream, InitialWindowsSize: c.InitialWindowsSize, UserAgent: c.UserAgent}
-}
-
 func redact(v any) {
 	switch x := v.(type) {
 	case map[string]any:
 		for k, val := range x {
-			switch k {
-			case "id", "email", "privateKey", "private_key", "certificate", "key", "shortIds", "short_ids":
+			switch strings.ToLower(k) {
+			case "id", "email", "privatekey", "private_key", "certificate", "key", "shortids", "short_ids", "headers":
 				x[k] = "***"
 			default:
 				redact(val)
@@ -259,10 +252,6 @@ func redact(v any) {
 	case []any:
 		for _, val := range x {
 			redact(val)
-		}
-	case string:
-		if strings.Contains(x, "BEGIN ") {
-			// handled by key, defensive
 		}
 	}
 }

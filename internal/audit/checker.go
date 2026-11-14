@@ -2,7 +2,6 @@ package audit
 
 import (
 	"context"
-	"fmt"
 	"log/slog"
 	"net"
 	"strings"
@@ -176,13 +175,6 @@ func (c *Checker) Stats() StatCounters {
 	return c.stats
 }
 
-// Enabled reports whether rules could match anything.
-func (c *Checker) Enabled() bool {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	return c.rules != nil && c.rules.Len() > 0
-}
-
 // target extracts the sniffed domain and/or IP. Sniffing can turn an IP
 // literal into a domain (e.g. "127.0.0.1"), so domain values that parse as IPs
 // are also exposed to IP rules.
@@ -227,13 +219,4 @@ func ipString(ip net.IP) string {
 		return ""
 	}
 	return ip.String()
-}
-
-// TargetString is a diagnostic helper.
-func TargetString(dest xnet.Destination) string {
-	d, ip := target(dest)
-	if d != "" {
-		return fmt.Sprintf("%s:%d", d, dest.Port)
-	}
-	return fmt.Sprintf("%s:%d", ipString(ip), dest.Port)
 }

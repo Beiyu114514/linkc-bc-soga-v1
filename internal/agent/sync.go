@@ -29,6 +29,7 @@ func (a *Agent) Sync(ctx context.Context) error {
 	if engine == nil {
 		return fmt.Errorf("agent is not bootstrapped")
 	}
+	a.flushPendingRemove(ctx, engine)
 
 	var rawNode *panel.Node
 	var rawUsers []panel.User
@@ -128,9 +129,10 @@ func (a *Agent) Sync(ctx context.Context) error {
 			a.setApplyError(err)
 			nodeUpdated = false // keep the current spec; retry next pull
 		} else {
-			if err := engine.RemoveInbound(ctx, oldTag); err != nil {
-				// The new listener is live; a stale listener is noisy but not fatal.
-				a.log.Warn("remove old inbound", "tag", oldTag, "error", err)
+			if err := a.removeInbound(ctx, engine, oldTag); err != nil {
+				// The new listener is live but the old one survives; it was queued
+				// for retry so it cannot silently keep serving stale users/certs.
+				a.log.Error("remove old inbound; queued for retry", "tag", oldTag, "error", err)
 			}
 			engine.SetNodeSpeed(spec.Basic.SpeedLimit)
 			a.mu.Lock()
@@ -177,36 +179,44 @@ func (a *Agent) Sync(ctx context.Context) error {
 		a.collect(ctx)
 	}
 
-	if auditOK && (rulesChanged || whiteChanged || !auditLoaded) && a.audit != nil {
-		if rulesChanged {
-			if err := a.store.PutLastGood("audit_rules", rawRules); err != nil {
-				a.log.Warn("save last_good audit_rules", "error", err)
-			}
-		}
-		if whiteChanged {
-			if err := a.store.PutLastGood("white_list", rawWhite); err != nil {
-				a.log.Warn("save last_good white_list", "error", err)
-			}
-		}
-		// The local whitelist file may have changed; reload it each pull.
+	if a.audit != nil {
+		a.audit.Prune()
+	}
+	if auditOK && a.audit != nil {
+		// The local whitelist file may have changed on disk; reload it on every
+		// pull so edits take effect even when the panel answers 304.
+		localChanged := false
 		if a.cfg.Node.Audit.WhiteListFile != "" {
 			if local, err := loadWhiteList(a.cfg.Node.Audit.WhiteListFile); err != nil {
 				a.log.Warn("reload whitelist", "error", err)
-			} else {
+			} else if !equalStrings(a.localWhite, local) {
 				a.localWhite = local
+				localChanged = true
 			}
 		}
-		merged := a.mergeWhiteList(rawWhite)
-		stats, err := a.audit.Update(rawRules, merged)
-		if err != nil {
-			rulesErr = errors.Join(rulesErr, fmt.Errorf("apply audit rules: %w", err))
-			a.setApplyError(err)
-		} else {
-			a.mu.Lock()
-			a.auditLoaded = true
-			a.mu.Unlock()
-			if stats.Compiled > 0 || stats.Skipped > 0 {
-				a.log.Info("audit rules applied", "compiled", stats.Compiled, "skipped", stats.Skipped)
+		if rulesChanged || whiteChanged || localChanged || !auditLoaded {
+			if rulesChanged {
+				if err := a.store.PutLastGood(a.lastGood("audit_rules"), rawRules); err != nil {
+					a.log.Warn("save last_good audit_rules", "error", err)
+				}
+			}
+			if whiteChanged {
+				if err := a.store.PutLastGood(a.lastGood("white_list"), rawWhite); err != nil {
+					a.log.Warn("save last_good white_list", "error", err)
+				}
+			}
+			merged := a.mergeWhiteList(rawWhite)
+			stats, err := a.audit.Update(rawRules, merged)
+			if err != nil {
+				rulesErr = errors.Join(rulesErr, fmt.Errorf("apply audit rules: %w", err))
+				a.setApplyError(err)
+			} else {
+				a.mu.Lock()
+				a.auditLoaded = true
+				a.mu.Unlock()
+				if stats.Compiled > 0 || stats.Skipped > 0 {
+					a.log.Info("audit rules applied", "compiled", stats.Compiled, "skipped", stats.Skipped)
+				}
 			}
 		}
 	}
@@ -216,4 +226,17 @@ func (a *Agent) Sync(ctx context.Context) error {
 
 func (a *Agent) specPanel(spec node.Spec) panel.Node {
 	return panel.Node{Basic: spec.Basic, Config: spec.Config, NodeType: spec.NodeType, TrafficRate: spec.TrafficRate}
+}
+
+// equalStrings reports whether two string slices hold the same elements.
+func equalStrings(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }

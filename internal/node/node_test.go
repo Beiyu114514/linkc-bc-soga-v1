@@ -1,6 +1,8 @@
 package node
 
 import (
+	"bytes"
+	"encoding/base64"
 	"strings"
 	"testing"
 
@@ -10,6 +12,38 @@ import (
 
 func validPanel(uuid string) panel.User {
 	return panel.User{ID: 1, UUID: uuid, SpeedLimit: 2, DeviceLimit: 3, TCPLimit: 0}
+}
+
+func TestSpecLocalRealityOverrides(t *testing.T) {
+	seed := base64.RawURLEncoding.EncodeToString(bytes.Repeat([]byte{0x2a}, 32))
+	s := Spec{NodeType: "vless", Config: panel.Config{
+		Port: 443, StreamType: "tcp", TLSType: "reality",
+		PrivateKey: "priv", ServerNames: []string{"a.example.com"}, Dest: "a.example.com:443", XVER: 1,
+	}}
+	xc, err := s.Xray(LocalRuntime{Listen: "127.0.0.1", RealityXVER: 2, MLDSA65Seed: seed})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if xc.XVER != 2 {
+		t.Fatalf("xver = %d, want local override 2", xc.XVER)
+	}
+	if xc.MLDSA65Seed != seed {
+		t.Fatalf("mldsa65 seed = %q", xc.MLDSA65Seed)
+	}
+	raw, err := xray.BuildConfig(xc, nil, "vless-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(raw, `"mldsa65Seed":"`+seed+`"`) || !strings.Contains(raw, `"xver":2`) {
+		t.Fatalf("raw = %s", raw)
+	}
+	// Panel xver is used when no local override is set.
+	if xc2, err := s.Xray(LocalRuntime{Listen: "127.0.0.1"}); err != nil || xc2.XVER != 1 {
+		t.Fatalf("panel xver fallback: xver=%d err=%v", xc2.XVER, err)
+	}
+	if _, err := s.Xray(LocalRuntime{Listen: "127.0.0.1", MLDSA65Seed: "not-base64"}); err == nil {
+		t.Fatal("expected invalid mldsa65 seed error")
+	}
 }
 
 func TestNormalizeUsers(t *testing.T) {

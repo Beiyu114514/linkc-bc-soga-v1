@@ -37,6 +37,8 @@ type LocalRuntime struct {
 	MinVersion       string
 	ECHServerKeys    string
 	Decryption       string
+	RealityXVER      int
+	MLDSA65Seed      string
 	XHTTP            *xray.XHTTPConfig
 	GRPC             *xray.GRPCConfig
 	Audit            xray.AuditChecker
@@ -124,7 +126,7 @@ func (s Spec) Xray(local LocalRuntime) (xray.NodeConfig, error) {
 		Dest:             s.Config.Dest,
 		Path:             s.Config.Path,
 		ServiceName:      s.Config.ServiceName,
-		XVER:             s.Config.XVER,
+		XVER:             firstNonZero(local.RealityXVER, s.Config.XVER),
 		SpeedLimit:       s.Basic.SpeedLimit,
 		AllowPrivate:     local.AllowPrivate,
 		CertPEM:          local.CertPEM,
@@ -137,6 +139,7 @@ func (s Spec) Xray(local LocalRuntime) (xray.NodeConfig, error) {
 		MinVersion:       local.MinVersion,
 		Decryption:       firstNonEmpty(s.Config.Decryption, local.Decryption),
 		ECHServerKeys:    firstNonEmpty(s.Config.ECHKey, local.ECHServerKeys),
+		MLDSA65Seed:      local.MLDSA65Seed,
 		XHTTP:            firstXHTTP(convertXHTTP(s.Config.XHTTP), local.XHTTP),
 		GRPC:             firstGRPC(convertGRPC(s.Config.GRPC), local.GRPC),
 		Audit:            local.Audit,
@@ -171,6 +174,13 @@ func convertGRPC(in *panel.GRPCConfig) *xray.GRPCConfig {
 
 func firstNonEmpty(a, b string) string {
 	if a != "" {
+		return a
+	}
+	return b
+}
+
+func firstNonZero(a, b int) int {
+	if a != 0 {
 		return a
 	}
 	return b
@@ -222,6 +232,7 @@ func InboundFingerprint(cfg xray.NodeConfig) string {
 		Certificates  []xray.TLSCertificate
 		Decryption    string
 		ECHServerKeys string
+		MLDSA65Seed   string
 		XHTTP         *xray.XHTTPConfig
 		GRPC          *xray.GRPCConfig
 	}{
@@ -230,7 +241,8 @@ func InboundFingerprint(cfg xray.NodeConfig) string {
 		ShortIDs: cfg.ShortIDs, Dest: cfg.Dest, Path: cfg.Path,
 		ServiceName: cfg.ServiceName, XVER: cfg.XVER, CertPEM: cfg.CertPEM, KeyPEM: cfg.KeyPEM,
 		Certificates: cfg.Certificates, Decryption: cfg.Decryption, ECHServerKeys: cfg.ECHServerKeys,
-		XHTTP: cfg.XHTTP, GRPC: cfg.GRPC,
+		MLDSA65Seed: cfg.MLDSA65Seed,
+		XHTTP:       cfg.XHTTP, GRPC: cfg.GRPC,
 	}
 	b, _ := json.Marshal(payload)
 	h := sha256.Sum256(b)

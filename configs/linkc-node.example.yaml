@@ -38,6 +38,7 @@ node:
 
   reality:
     xver: 0
+    mldsa65_seed: ""                 # 可选，base64url 编码的 32 字节 REALITY ML-DSA-65 seed
 
   # Optional local extensions; the target site does not send these fields.
   # They are used when the panel leaves the corresponding field empty.
@@ -84,7 +85,6 @@ node:
   alive_ip:
     mode: "changed"                    # changed | full
     full_every: 20                     # changed 模式下每 N 次补一次全量
-    clear_offline: false               # 目标站点不清除离线 IP
 
   status:
     mode: "load_fraction"              # load is CPU fraction (0..1)
@@ -101,7 +101,6 @@ node:
 
   geodata:
     dir: "/usr/share/xray"             # geosite.dat / geoip.dat
-    auto_update: false
 
 storage:
   path: "/var/lib/linkc-node"

@@ -1,5 +1,5 @@
 name: linkc-node
-arch: amd64
+arch: ${ARCH}
 platform: linux
 version: ${VERSION}
 section: net
@@ -8,7 +8,7 @@ maintainer: LinkC
 description: soga-v1 VLESS node agent with embedded Xray-core
 license: UNLICENSED
 contents:
-  - src: dist/linkc-node-linux-amd64
+  - src: dist/linkc-node-linux-${ARCH}
     dst: /usr/local/bin/linkc-node
     file_info:
       mode: 0755

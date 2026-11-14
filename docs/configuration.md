@@ -1,7 +1,7 @@
 # 配置说明（M1）
 
 配置文件默认 `/etc/linkc-node/config.yaml`，示例见 `configs/linkc-node.example.yaml`。
-所有字符串支持 `${ENV_NAME}` 环境变量展开；未设置会直接报错。
+所有标量支持 `${ENV_NAME}` 环境变量展开；未设置会直接报错。展开在 YAML 解析后进行，含特殊字符的值不会被破坏或注入配置（字符串值建议加引号，未加引号的 `${PORT}` 会按数字解析）。
 
 ## panel
 
@@ -28,7 +28,7 @@
 | `push_interval` | `60s` | 面板 `basic.push_interval` 优先 |
 | `collect_interval` | `30s` | 必须 ≤ 推送间隔（建议） |
 | `status_interval` | `5s` | 本机状态采样 |
-| `tls.certificates` | 空 | `tls_type=tls` 时必需；MVP 仅一张 |
+| `tls.certificates` | 空 | `tls_type=tls` 时必需；支持多组，Xray 按 SNI 选择 |
 | `tls.alpn` | 空 | 例如 `["h2","http/1.1"]` |
 | `tls.min_version` | 空 | `1.2` / `1.3` |
 | `freedom.allow_private_targets` | `false` | 生产保持 false，阻止 SSRF |
@@ -76,7 +76,7 @@ node:
 ### 证书与 REALITY
 
 - TLS 证书从本地文件读取到内存后以 inline PEM 注入 Xray；不依赖 Xray 的文件证书热加载（该路径存在上游 data race）。
-- REALITY 的 `private_key`、`short_ids`、`server_names`、`dest` 全部来自面板；本地只提供 `xver`。
+- REALITY 的 `private_key`、`short_ids`、`server_names`、`dest` 来自面板；`xver` 与可选的 `mldsa65_seed` 可由本地 `node.reality.*` 覆盖。
 - `tls_type=xtls` 会被拒绝并提示改用 `tls`/`reality`；目标站点会把 xtls 映射为 none。
 
 ### 限额模式
@@ -113,3 +113,5 @@ node:
 - `storage.max_journal_bytes`：未确认流量 journal 上限，达到后暂停采集并告警。
 - `logging.format`：`json`（生产）或 `text`（调试）。
 - `admin.socket`：Unix socket，0600；提供 `/healthz`、`/readyz`、`/status`、`/metrics`。
+- `admin.metrics=false` 时不注册 `/metrics`。
+- `admin.pprof=true` 时额外注册 `/debug/pprof/*`（仅本地 socket 可达）。

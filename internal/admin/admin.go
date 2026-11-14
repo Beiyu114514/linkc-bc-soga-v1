@@ -7,12 +7,19 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"net/http/pprof"
 	"os"
 	"path/filepath"
 	"time"
 
 	"github.com/Beiyu114514/linkc-bc-soga-v1/internal/agent"
 )
+
+// Options controls which optional handlers are exposed.
+type Options struct {
+	Metrics bool
+	Pprof   bool
+}
 
 // Server is the admin Unix-socket server.
 type Server struct {
@@ -21,7 +28,7 @@ type Server struct {
 	srv  *http.Server
 }
 
-func Start(path string, snapshot func() agent.Snapshot) (*Server, error) {
+func Start(path string, snapshot func() agent.Snapshot, opts Options) (*Server, error) {
 	if path == "" {
 		return nil, fmt.Errorf("admin: empty socket path")
 	}
@@ -52,7 +59,24 @@ func Start(path string, snapshot func() agent.Snapshot) (*Server, error) {
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(snapshot())
 	})
-	mux.HandleFunc("/metrics", func(w http.ResponseWriter, r *http.Request) {
+	if opts.Pprof {
+		mux.HandleFunc("/debug/pprof/", pprof.Index)
+		mux.HandleFunc("/debug/pprof/cmdline", pprof.Cmdline)
+		mux.HandleFunc("/debug/pprof/profile", pprof.Profile)
+		mux.HandleFunc("/debug/pprof/symbol", pprof.Symbol)
+		mux.HandleFunc("/debug/pprof/trace", pprof.Trace)
+	}
+	if opts.Metrics {
+		mux.HandleFunc("/metrics", metricsHandler(snapshot))
+	}
+	srv := &http.Server{Handler: mux, ReadHeaderTimeout: 5 * time.Second}
+	s := &Server{path: path, ln: ln, srv: srv}
+	go func() { _ = srv.Serve(ln) }()
+	return s, nil
+}
+
+func metricsHandler(snapshot func() agent.Snapshot) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
 		s := snapshot()
 		w.Header().Set("Content-Type", "text/plain; version=0.0.4")
 		fmt.Fprintf(w, "# TYPE linkc_ready gauge\nlinkc_ready %d\n", boolInt(s.Ready))
@@ -69,11 +93,7 @@ func Start(path string, snapshot func() agent.Snapshot) (*Server, error) {
 		fmt.Fprintf(w, "# TYPE linkc_audit_hits_total counter\nlinkc_audit_hits_total %d\n", s.AuditHits)
 		fmt.Fprintf(w, "# TYPE linkc_audit_reported_total counter\nlinkc_audit_reported_total %d\n", s.AuditReported)
 		fmt.Fprintf(w, "# TYPE linkc_audit_blocked_total counter\nlinkc_audit_blocked_total %d\n", s.AuditBlocked)
-	})
-	srv := &http.Server{Handler: mux, ReadHeaderTimeout: 5 * time.Second}
-	s := &Server{path: path, ln: ln, srv: srv}
-	go func() { _ = srv.Serve(ln) }()
-	return s, nil
+	}
 }
 
 func (s *Server) Close() error {

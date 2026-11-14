@@ -1,4 +1,5 @@
 VERSION ?= dev
+ARCH ?= amd64
 COMMIT ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo unknown)
 DATE ?= $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
 LDFLAGS := -s -w \
@@ -34,10 +35,10 @@ fmt:
 clean:
 	rm -rf linkc-node dist
 
-package-deb:
+package-deb: linux-$(ARCH)
 	mkdir -p dist
-	VERSION=$(VERSION) nfpm package -f packaging/nfpm.yaml -p deb -t dist/
+	ARCH=$(ARCH) VERSION=$(VERSION) nfpm package -f packaging/nfpm.yaml -p deb -t dist/
 
-package-rpm:
+package-rpm: linux-$(ARCH)
 	mkdir -p dist
-	VERSION=$(VERSION) nfpm package -f packaging/nfpm.yaml -p rpm -t dist/
+	ARCH=$(ARCH) VERSION=$(VERSION) nfpm package -f packaging/nfpm.yaml -p rpm -t dist/

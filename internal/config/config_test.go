@@ -82,6 +82,56 @@ panel:
 	}
 }
 
+func TestLoadEnvExpansionTyped(t *testing.T) {
+	t.Setenv("T_MAX_ATTEMPTS", "7")
+	t.Setenv("T_PANEL_KEY", "p@ss: #not-a-comment")
+	path := writeConfig(t, `
+panel:
+  base_url: "http://127.0.0.1:8080"
+  api_key: "${T_PANEL_KEY}"
+  node_id: "1"
+  allow_http: true
+  max_attempts: ${T_MAX_ATTEMPTS}
+storage:
+  path: "`+t.TempDir()+`"
+`)
+	c, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Panel.APIKey != "p@ss: #not-a-comment" {
+		t.Fatalf("api key = %q", c.Panel.APIKey)
+	}
+	if c.Panel.MaxAttempts != 7 {
+		t.Fatalf("max_attempts = %d", c.Panel.MaxAttempts)
+	}
+}
+
+func TestCheckDoesNotCreateStorage(t *testing.T) {
+	c := Default()
+	c.Panel.BaseURL = "https://example.com"
+	c.Panel.APIKey = "k"
+	c.Panel.NodeID = "1"
+	c.Storage.Path = filepath.Join(t.TempDir(), "does-not-exist", "state")
+	if err := c.Check(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(c.Storage.Path); !os.IsNotExist(err) {
+		t.Fatalf("Check created storage path (stat err = %v)", err)
+	}
+}
+
+func TestValidateTrafficBounds(t *testing.T) {
+	c := Default()
+	c.Panel.BaseURL = "https://example.com"
+	c.Panel.APIKey = "k"
+	c.Panel.NodeID = "1"
+	c.Node.Traffic.BatchBytes = 0
+	if err := c.Validate(); err == nil {
+		t.Fatal("expected batch_bytes error")
+	}
+}
+
 func TestValidateTransportEnums(t *testing.T) {
 	c := Default()
 	c.Panel.BaseURL = "https://example.com"

@@ -38,12 +38,3 @@ func (c *Checker) Push(ctx context.Context, client *panel.Client, batch int) (in
 	}
 	return len(items), nil
 }
-
-// Enabled reports whether the checker has rules.
-func (c *Checker) HasPending() bool {
-	if c.st == nil {
-		return false
-	}
-	events, err := c.st.PendingAudit(1)
-	return err == nil && len(events) > 0
-}
