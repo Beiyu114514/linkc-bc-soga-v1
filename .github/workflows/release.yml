@@ -26,13 +26,22 @@ jobs:
           go-version-file: go.mod
           cache: true
 
-      - name: Install nfpm
-        run: go install github.com/goreleaser/nfpm/v2/cmd/nfpm@v2.49.0
-
       - name: Gate (vet + test)
         run: |
           go vet ./...
           go test ./... -count=1
+
+      - name: Install nfpm
+        run: |
+          set -euo pipefail
+          # Prebuilt binary: nfpm v2.49 needs Go >= 1.27.4 to build, and CI
+          # pins the toolchain from go.mod (GOTOOLCHAIN=local).
+          version=2.49.0
+          mkdir -p "$RUNNER_TEMP/bin"
+          curl -sSfL "https://github.com/goreleaser/nfpm/releases/download/v${version}/nfpm_${version}_Linux_x86_64.tar.gz" \
+            | tar -xz -C "$RUNNER_TEMP/bin" nfpm
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+          "$RUNNER_TEMP/bin/nfpm" --version
 
       - name: Build release artifacts
         env:
