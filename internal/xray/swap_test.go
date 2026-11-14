@@ -171,8 +171,8 @@ func TestSwapInboundRollbackRestoresOld(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected swap error when the old listener cannot be removed")
 	}
-	if !rep.RolledBack {
-		t.Fatalf("expected rollback, got %+v (err=%v)", rep, err)
+	if !rep.RolledBack || rep.Applied {
+		t.Fatalf("expected a non-applied rollback, got %+v (err=%v)", rep, err)
 	}
 	if rep.Tag != oldTag || e.Tag() != oldTag {
 		t.Fatalf("tag = %q / engine %q, want %q", rep.Tag, e.Tag(), oldTag)
@@ -250,8 +250,8 @@ func TestSwapInboundAddFailureKeepsOld(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected add failure")
 	}
-	if rep.RolledBack {
-		t.Fatalf("add failure must not roll back: %+v", rep)
+	if rep.RolledBack || rep.Applied {
+		t.Fatalf("add failure must not report applied/rolled back: %+v", rep)
 	}
 	if rep.Tag != oldTag || e.Tag() != oldTag {
 		t.Fatalf("tag = %q / engine %q, want the still-active %q", rep.Tag, e.Tag(), oldTag)
@@ -284,8 +284,8 @@ func TestSwapInboundKeepsNewWhenOldRemovalStuck(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error for the stuck old listener")
 	}
-	if rep.RolledBack {
-		t.Fatalf("must not report rollback: %+v", rep)
+	if rep.RolledBack || !rep.Applied {
+		t.Fatalf("expected an applied swap with a stale old listener: %+v", rep)
 	}
 	if rep.Warning == "" {
 		t.Fatal("expected a warning about the stale old listener")

@@ -13,31 +13,36 @@
 
 | 场景 | 行为 |
 |---|---|
-| 新 inbound 添加失败 | 旧 inbound 原样服务，`Tag` = 旧 tag，agent 下一轮重试 |
-| 添加成功、旧移除成功 | 提交新状态（tag/users/port/gate 限额） |
-| 旧移除失败 | **回滚**：移除新 inbound；旧 handler 仍在册则直接恢复引擎状态，否则用旧配置重加（旧 tag） |
-| 回滚时新 inbound 也摘不掉 | 保留新 inbound 服务，`Warning` 报告残留旧监听 |
-| 回滚本身失败（旧配置无法恢复） | 尝试把新配置加回来；仍失败则 `Tag=""`，agent 置空 `inboundFP` 强制下轮重放 |
+| 新 inbound 添加失败 | 旧 inbound 原样服务，`Tag` = 旧 tag，`Applied=false`，agent 下一轮重试 |
+| 添加成功、旧移除成功 | 提交新状态（tag/users/port/gate 限额），`Applied=true` |
+| 旧 tag 已不存在（`RemoveHandler` not found） | 旧 listener 已经关闭，新 inbound 是唯一 listener，提交新状态并给出 `Warning` |
+| 旧 handler 仍在册（管理器异常） | **回滚**：移除新 inbound，恢复旧状态，`RolledBack=true` |
+| 回滚时新 inbound 也摘不掉 | 保留新 inbound 服务，`StaleTag` 报告残留旧监听，agent 排队重试移除 |
+| 添加/回滚失败 | `Applied=false`；仅当 `Tag==""` 时 agent 置空 `inboundFP` 强制下轮重放 |
 
 实现要点：Xray 的 `core.AddInboundHandler` 从实例自身取 manager（包装 `Engine.inboundMgr`
 拦不住 add），因此 add 失败经 `addInbound` 间接层注入；移除失败经 manager 包装注入。
-`RemoveHandler` 对已注册 tag 实际几乎不失败（close 错误仅记日志），失败主要来自
-tag 不存在/管理器异常，回滚逻辑按此现实设计。
+`RemoveHandler` 对已注册 tag 会关闭 handler、记日志并删除 tag，返回 nil；只有 tag
+不存在才报错。因此“旧 tag 不存在”按成功处理，不再重新加回旧配置。`SwapInbound`
+用 `swapMu` 串行化，避免并发 swap 互相移除 tag。
 
-测试（`internal/xray/swap_test.go`，5 条分支全覆盖）：
+测试（`internal/xray/swap_test.go`）：
 `TestSwapInboundRollbackRestoresOld`（回滚后旧端口/旧用户集仍在服务，新端口关闭，
 随后无故障 swap 自愈）、`TestSwapInboundAddFailureKeepsOld`、
-`TestSwapInboundKeepsNewWhenOldRemovalStuck`、`TestSwapInboundRollbackFailureKeepsNew`、
-`TestSwapInboundNoListenerIsRecoverable`。
+`TestSwapInboundKeepsNewWhenOldRemovalStuck`（`StaleTag`）、
+`TestSwapInboundOldTagGoneCommitsNew`（真实 manager 下旧 tag 已删除）、
+`TestSwapInboundValidationErrorKeepsOldTag`。
 
-agent 侧（`internal/agent/sync.go`、`agent.go ReloadCerts`）改为按 `SwapReport`
-提交/回滚/强制重放，并抽出 `commitNode`。
+agent 侧（`internal/agent/sync.go`、`agent.go ReloadCerts`）按 `SwapReport.Applied`
+提交/回滚/强制重放，并抽出 `commitNode`；`internal/agent/swap_test.go` 覆盖
+“add 失败不提交新配置、旧 inbound 继续服务、端口释放后重试成功”。
 
 ## 2. 证书：真实轮换 E2E + 多证书 SNI + 一个真 bug
 
 - `internal/agent/certs_test.go`：
   - `TestReloadCertsRotatesServingCertificate`：TLS 节点 + 本地证书文件启动 →
-    客户端按 pin A 连通 → 磁盘替换证书 → `ReloadCerts()`（SIGHUP 路径）→
+    客户端按 pin A 连通 → 磁盘替换证书 → `ReloadCerts()`（SIGHUP handler 路径，
+    测试直接调用方法而非发信号）→
     按 pin B 连通、pin A 握手失败 → 空 reload 为 no-op。
   - `TestReloadCertsMissingFileKeepsOld`：key 文件损坏时 reload 报错且旧 inbound 继续服务。
 - `internal/xray/certs_test.go` `TestStartMultiCertificateSNI`：一个 inbound 两张证书，
@@ -65,7 +70,7 @@ mock panel 新增故障注入 `SetFault(path, status, times)` / `ClearFaults()`
 
 | 项 | 结果 |
 |---|---|
-| `ApplyUsers(10000)` | 19.4ms（benchmark 4.79ms/op，热路径） |
+| `ApplyUsers(10000)` | 19.4ms（steady-state benchmark 4.79ms/op，不重复 add/remove） |
 | `ReadTraffic(10000 users)` | 1.85ms（benchmark 2.16ms/op） |
 | `OnlineIPs(10000 users)` | 0.70ms |
 | 数据面吞吐（limits off，单连接 64MiB） | 22.3Gbps（67108864B / 24.1ms） |
@@ -78,7 +83,8 @@ mock panel 新增故障注入 `SetFault(path, status, times)` / `ClearFaults()`
 `SOAK_DURATION=<dur> go test ./internal/agent -run TestSoak`（或 `make soak`）。
 每轮随机注入：面板 5xx/429、webapi 503、**节点配置端口切换**（走新 SwapInbound）、
 用户 churn、**证书轮换**、流量突发；每轮后断言数据面恢复、`ready`、journal 有界、
-agent 不退出。已跑 3 个种子 ×60s 与 25s 冒烟通过（约 20 轮/秒）。
+agent 不退出。端口切换/证书轮换会显式关闭旧 client，避免 24h 运行泄漏 Xray 实例。
+已跑 3 个种子 ×60s 与 25s 冒烟通过（约 20 轮/秒）。
 **24h 实跑仍未做**（需在目标机执行 `SOAK_DURATION=24h make soak`）。
 
 ## 6. 打包实测
@@ -112,14 +118,15 @@ agent 不退出。已跑 3 个种子 ×60s 与 25s 冒烟通过（约 20 轮/秒
 
 ```
 internal/xray/runtime.go        SwapInbound 事务 + commit/userListLocked + addInbound seam
-internal/xray/swap_test.go      新增：5 条回滚分支测试
+internal/xray/swap_test.go      新增：回滚/旧 tag 已删/校验失败等分支测试
 internal/xray/certs_test.go     新增：多证书 SNI E2E
 internal/xray/load_test.go      新增：10k 用户/吞吐测试 + 2 个 benchmark
 internal/agent/sync.go          SwapInbound 集成（提交/回滚/强制重放）
 internal/agent/agent.go         ReloadCerts 事务化 + commitNode + AuditPending
 internal/agent/certs_test.go    新增：SIGHUP 轮换 E2E、坏 key 文件
 internal/agent/chaos_test.go    新增：4 个混沌测试
-internal/agent/soak_test.go     新增：长稳 harness
+internal/agent/soak_test.go     新增：长稳 harness（轮换时关闭旧 client）
+internal/agent/swap_test.go     新增：add 失败不提交状态、释放端口后重试回归
 internal/node/spec.go           修复：透传 local.Certificates
 internal/node/node_test.go      新增：多证书透传回归
 internal/audit/pusher.go        新增：Checker.Pending()

@@ -1722,8 +1722,8 @@ mock panel 必须复刻目标站点 `SogaController` 的实际行为，而不仅
 
 ### M4 · 加固与交付（4-5 人日）— ✅ 完成（M5 收尾）
 
-- [x] inbound 热切换事务化：添加失败保留旧配置；旧移除失败自动回滚到旧 inbound（`Engine.SwapInbound`，含「新 inbound 也摘不掉」与「回滚本身失败」的兜底路径，单测覆盖 5 条分支）。
-- [x] 多证书/SNI、SIGHUP 证书热加载；真实 TLS 轮换 E2E 已补（`TestReloadCertsRotatesServingCertificate`）；顺带修复 `Spec.Xray` 丢弃 `node.tls.certificates` 的 bug（`TestSpecPassesLocalCertificates`）。
+- [x] inbound 热切换事务化：添加失败保留旧配置；旧 tag 已不存在按成功提交新 inbound；旧 handler 仍在册时回滚；新 inbound 摘不掉时保留新并排队清理旧 tag（`Engine.SwapInbound`，单测覆盖 5 条分支）。
+- [x] 多证书/SNI、SIGHUP 证书热加载；TLS 轮换 E2E 已补（`TestReloadCertsRotatesServingCertificate`，走 SIGHUP handler 路径）；顺带修复 `Spec.Xray` 丢弃 `node.tls.certificates` 的 bug（`TestSpecPassesLocalCertificates`）。
 - [x] 安全加固（systemd/权限/umask/输入校验/脱敏）；审计报告见 `docs/security-audit.md`。
 - [x] 故障注入/混沌：面板 5xx/429、webapi 503、journal 写满、端口切换、用户 churn、证书轮换均有测试；长稳 harness 就绪（`make soak`，`SOAK_DURATION=24h`）。
 - [x] Makefile、安装脚本、nfpm 模板、升级/回滚文档；deb/rpm 打包实测通过（安装/升级/卸载、权限、conffile）。
