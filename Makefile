@@ -4,12 +4,13 @@ COMMIT ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo unknown)
 DATE ?= $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
 SOAK_DURATION ?= 90s
 SOAK_TIMEOUT ?= 2m
+LINKC_LAUNCHER_USER ?= admin
 LDFLAGS := -s -w \
   -X github.com/Beiyu114514/linkc-bc-soga-v1/internal/version.Version=$(VERSION) \
   -X github.com/Beiyu114514/linkc-bc-soga-v1/internal/version.Commit=$(COMMIT) \
   -X github.com/Beiyu114514/linkc-bc-soga-v1/internal/version.Date=$(DATE)
 
-.PHONY: all build linux-amd64 linux-arm64 test race vet fmt clean clean-dist package-deb package-rpm release-artifacts soak bench
+.PHONY: all build linux-amd64 linux-arm64 test race vet fmt clean clean-dist package-deb package-rpm release-artifacts soak bench docker-launch test-launcher
 
 all: build
 
@@ -64,3 +65,13 @@ soak:
 
 bench:
 	go test ./internal/xray -run '^$$' -bench . -benchtime 20x
+
+# The launcher defaults to 0.0.0.0 and requires a page login. Override the
+# username with LINKC_LAUNCHER_USER; a random password is generated, printed,
+# and written as JSON to ~/.linkc-node/launcher-credentials.json (0600).
+docker-launch:
+	./scripts/docker-launch.sh --username $(LINKC_LAUNCHER_USER)
+
+# Unit tests for the Docker launcher (stdlib only; no Docker or root needed).
+test-launcher:
+	python3 -m unittest discover -s scripts -p 'test_*.py' -v

@@ -4,3 +4,7 @@
 *.db.bak
 *.db.lock
 .DS_Store
+
+# Python launcher caches
+__pycache__/
+*.pyc

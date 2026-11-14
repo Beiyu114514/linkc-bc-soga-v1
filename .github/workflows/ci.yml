@@ -55,6 +55,27 @@ jobs:
           cache: true
       - run: go test -race ./... -count=1
 
+  launcher:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: python compile
+        run: python3 -m compileall -q scripts/docker_launcher.py scripts/test_docker_launcher.py
+      - name: launcher unit tests
+        run: python3 -m unittest discover -s scripts -p 'test_*.py' -v
+      - name: shell syntax
+        run: bash -n scripts/docker-launch.sh
+      - name: inline JS parses
+        run: |
+          node -e '
+            const fs = require("fs");
+            const html = fs.readFileSync("scripts/docker-launcher.html", "utf8");
+            const match = html.match(/<script>([\s\S]*?)<\/script>/);
+            if (!match) throw new Error("no inline <script> found");
+            new Function(match[1]);
+            console.log("launcher inline script parses");
+          '
+
   build:
     runs-on: ubuntu-latest
     steps:
