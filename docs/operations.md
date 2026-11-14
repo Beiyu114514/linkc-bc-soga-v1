@@ -49,6 +49,19 @@ docker run --rm --network host \
 
 必须使用 `--network host`：端口映射会丢失真实源 IP，影响在线 IP 与设备数限制。
 
+预构建镜像（由 `.github/workflows/docker.yml` 推送，多架构 amd64/arm64）：
+
+```bash
+docker pull ghcr.io/beiyu114514/linkc-bc-soga-v1:latest
+docker run --rm --network host \
+  -v /etc/linkc-node:/etc/linkc-node:ro \
+  -v /var/lib/linkc-node:/var/lib/linkc-node \
+  ghcr.io/beiyu114514/linkc-bc-soga-v1:latest
+```
+
+镜像内附带示例配置 `/etc/linkc-node/config.yaml.example`；运行时以 UID 10001 执行，
+状态目录需对该 UID 可写（`chown -R 10001:10001 /var/lib/linkc-node`）。
+
 ## 面板故障
 
 - 启动时优先使用 `last_good`；面板不可达仍可启动并继续代理。

@@ -9,7 +9,7 @@ LDFLAGS := -s -w \
   -X github.com/Beiyu114514/linkc-bc-soga-v1/internal/version.Commit=$(COMMIT) \
   -X github.com/Beiyu114514/linkc-bc-soga-v1/internal/version.Date=$(DATE)
 
-.PHONY: all build linux-amd64 linux-arm64 test race vet fmt clean package-deb package-rpm soak bench
+.PHONY: all build linux-amd64 linux-arm64 test race vet fmt clean clean-dist package-deb package-rpm release-artifacts soak bench
 
 all: build
 
@@ -36,6 +36,18 @@ fmt:
 
 clean:
 	rm -rf linkc-node dist
+
+clean-dist:
+	rm -rf dist
+
+# Build every release artifact (binaries + deb/rpm + checksums). Pass an
+# explicit DATE so the recursive make invocations embed the same build time.
+release-artifacts: clean-dist
+	mkdir -p dist
+	$(MAKE) linux-amd64 linux-arm64 VERSION=$(VERSION) DATE=$(DATE)
+	$(MAKE) package-deb package-rpm VERSION=$(VERSION) ARCH=amd64 DATE=$(DATE)
+	$(MAKE) package-deb package-rpm VERSION=$(VERSION) ARCH=arm64 DATE=$(DATE)
+	cd dist && sha256sum * > SHA256SUMS
 
 package-deb: linux-$(ARCH)
 	mkdir -p dist

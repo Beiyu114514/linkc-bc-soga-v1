@@ -1,7 +1,13 @@
 .git
+.github
 .idea
 .vscode
 *.db
 *.db.bak
+*.md
 tmp
 dist
+docs
+deploy
+packaging
+scripts

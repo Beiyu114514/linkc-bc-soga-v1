@@ -1,5 +1,8 @@
 # linkc-bc-soga-v1
 
+[![ci](https://github.com/Beiyu114514/linkc-bc-soga-v1/actions/workflows/ci.yml/badge.svg)](https://github.com/Beiyu114514/linkc-bc-soga-v1/actions/workflows/ci.yml)
+[![docker](https://github.com/Beiyu114514/linkc-bc-soga-v1/actions/workflows/docker.yml/badge.svg)](https://github.com/Beiyu114514/linkc-bc-soga-v1/actions/workflows/docker.yml)
+
 基于 **Xray-core** 的 soga-v1 节点后端（soga 替代品）。
 
 - **目标站点**：SSPanel-UIM + `SogaController`（soga-v1 WebAPI 服务端）
@@ -51,6 +54,14 @@
 export PATH=/usr/local/go/bin:$PATH
 go build -trimpath -o linkc-node ./cmd/linkc-node
 ```
+
+## 发布
+
+- 打 tag `vX.Y.Z` 会触发 `.github/workflows/release.yml`：构建 amd64/arm64 二进制、deb/rpm 与 `SHA256SUMS`，并创建 GitHub Release。
+- `.github/workflows/docker.yml` 构建多架构镜像并推送到 `ghcr.io/beiyu114514/linkc-bc-soga-v1`：
+  标签 → `X.Y.Z` / `X.Y` / `latest`，`main` → `edge`，另附 `sha-<short>`。
+- 本地复现发布产物：`make release-artifacts VERSION=0.10.0`。
+- 手动重建某个 tag：`gh workflow run release.yml -f tag=v0.10.0`。
 
 Xray 版本固定为 release `v26.11.9` 的 commit 伪版本：
 `v1.260327.1-0.20261109052709-676eaf66f8f0`
