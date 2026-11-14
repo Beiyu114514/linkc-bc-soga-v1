@@ -231,20 +231,23 @@ func (a *Agent) Sync(ctx context.Context) error {
 				// Retry on the next pull: the fetched version is not live yet.
 				a.setAuditPending(true)
 			} else {
-				// Only advance last_good and the local whitelist once the new
-				// set is actually live, so they never lead the applied rules.
+				// Only advance the local whitelist once the new set is live, so it
+				// never leads the applied rules.
 				if localChanged {
 					a.localWhite = local
 				}
-				if rulesChanged {
-					if err := a.store.PutLastGood(a.lastGood("audit_rules"), rawRules); err != nil {
-						a.log.Warn("save last_good audit_rules", "error", err)
-					}
+				// Persist the version that is actually live, not just the one that
+				// changed in this pull: a retried update sees changed=false because
+				// the ETag already advanced, and gating the write on changed would
+				// leave last_good behind. A restart would then replay the older
+				// set and the newer cached body would never be applied again.
+				// auditOK guarantees both fetches succeeded, so rawRules/rawWhite
+				// hold the applied version (fresh body or 304 cache).
+				if err := a.store.PutLastGood(a.lastGood("audit_rules"), rawRules); err != nil {
+					a.log.Warn("save last_good audit_rules", "error", err)
 				}
-				if whiteChanged {
-					if err := a.store.PutLastGood(a.lastGood("white_list"), rawWhite); err != nil {
-						a.log.Warn("save last_good white_list", "error", err)
-					}
+				if err := a.store.PutLastGood(a.lastGood("white_list"), rawWhite); err != nil {
+					a.log.Warn("save last_good white_list", "error", err)
 				}
 				a.mu.Lock()
 				a.auditLoaded = true

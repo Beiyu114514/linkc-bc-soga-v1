@@ -92,6 +92,11 @@ type Agent struct {
 	lastErr   error
 	startedAt time.Time
 
+	// stopped is set by shutdown() while holding applyMu. ReloadCerts (SIGHUP)
+	// re-checks it after taking applyMu, so a certificate reload can never
+	// outlive the Xray engine that shutdown() closes.
+	stopped bool
+
 	applyMu   sync.Mutex
 	collectMu sync.Mutex
 
@@ -230,19 +235,23 @@ func (a *Agent) Bootstrap(ctx context.Context) error {
 			if _, err := a.audit.Update(rawRules, mergeWhiteList(rawWhite, a.localWhite)); err != nil {
 				a.log.Warn("bootstrap audit compile", "error", err)
 			} else {
-				a.mu.Lock()
-				a.auditLoaded = true
-				a.mu.Unlock()
-			}
-		}
-		if haveRules {
-			if err := a.store.PutLastGood(a.lastGood("audit_rules"), rawRules); err != nil {
-				a.log.Warn("save last_good audit_rules", "error", err)
-			}
-		}
-		if haveWhite {
-			if err := a.store.PutLastGood(a.lastGood("white_list"), rawWhite); err != nil {
-				a.log.Warn("save last_good white_list", "error", err)
+				// auditLoaded stays false on purpose: the rules above may come
+				// from last_good while the ETag cache already holds a newer body
+				// (e.g. a restart between a failed pull and its retry). Leaving
+				// it false makes the first successful Sync reconcile the audit
+				// set instead of trusting last_good forever.
+				// Persist only what is actually live, like Sync does: a failed
+				// compile must not let last_good lead the applied rules.
+				if haveRules {
+					if err := a.store.PutLastGood(a.lastGood("audit_rules"), rawRules); err != nil {
+						a.log.Warn("save last_good audit_rules", "error", err)
+					}
+				}
+				if haveWhite {
+					if err := a.store.PutLastGood(a.lastGood("white_list"), rawWhite); err != nil {
+						a.log.Warn("save last_good white_list", "error", err)
+					}
+				}
 			}
 		}
 	}
@@ -421,7 +430,7 @@ func (a *Agent) ReloadCerts() error {
 	a.applyMu.Lock()
 	defer a.applyMu.Unlock()
 	a.mu.Lock()
-	if a.closed {
+	if a.closed || a.stopped {
 		// Shutdown already closed the store and engine; nothing to reload.
 		a.mu.Unlock()
 		return nil
@@ -660,6 +669,17 @@ func (a *Agent) interval(kind string) time.Duration {
 }
 
 func (a *Agent) shutdown() {
+	// Run() returns only after this function, so the SIGHUP goroutine in
+	// cmd/linkc-node is joined *after* the engine is already closed. Serialize
+	// with ReloadCerts instead: it holds applyMu for its whole run and
+	// re-checks the stop flag once it has the lock, so the engine is never
+	// closed underneath an in-flight inbound swap.
+	a.applyMu.Lock()
+	a.mu.Lock()
+	a.stopped = true
+	a.mu.Unlock()
+	defer a.applyMu.Unlock()
+
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	a.collect(ctx)
