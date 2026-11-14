@@ -39,6 +39,27 @@ journalctl -u linkc-node -f
 
 ## Docker
 
+图形化一键启动（推荐首次使用）：
+
+```bash
+# 默认监听 0.0.0.0；自动生成并打印页面密码，写入 0600 JSON 凭据文件
+sudo ./scripts/docker-launch.sh --username admin
+
+# 仅本机访问
+sudo ./scripts/docker-launch.sh --bind 127.0.0.1
+
+# 用哈希文件（可选，不保存明文）
+sudo ./scripts/docker-launch.sh --hash-password --hash-password-output /root/.linkc-node/password.hash
+sudo ./scripts/docker-launch.sh --username admin --password-hash-file /root/.linkc-node/password.hash
+```
+
+页面会生成配置、API Key 文件、可选证书和 `docker-run.sh`，然后启动容器。默认监听
+`0.0.0.0`；非回环监听必须用 `--username` 启用登录，否则拒绝启动。仅本机用
+`--bind 127.0.0.1`。详见
+[docker-launcher.md](./docker-launcher.md)。
+
+手动方式：
+
 ```bash
 docker build -t linkc-node .
 docker run --rm --network host \
