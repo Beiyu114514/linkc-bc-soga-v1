@@ -10,6 +10,8 @@ license: UNLICENSED
 contents:
   - src: dist/linkc-node-linux-${ARCH}
     dst: /usr/local/bin/linkc-node
+    # nfpm only expands ${...} in contents when expand is set explicitly.
+    expand: true
     file_info:
       mode: 0755
   - src: deploy/linkc-node.service
