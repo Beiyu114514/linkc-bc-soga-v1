@@ -412,5 +412,135 @@ class DetectLanIpTest(unittest.TestCase):
         self.assertNotEqual(ip, "0.0.0.0")
 
 
+class RestoreBackupFilesTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.config_dir = self.tmp / "etc"
+        self.config_dir.mkdir()
+        self.backup = self.tmp / "backup"
+        self.backup.mkdir()
+        for name, content in {
+            "config.yaml": "old: true\n",
+            "api-key": "old-key\n",
+            "whitelist.txt": "old.example\n",
+            "launcher.json": "{}\n",
+            "docker-run.sh": "#!/bin/sh\n",
+            "fullchain.pem": "CERT\n",
+            "privkey.pem": "KEY\n",
+        }.items():
+            (self.backup / name).write_text(content)
+        (self.config_dir / "certs").mkdir()
+        for name, content in {
+            "config.yaml": "new: true\n",
+            "api-key": "new-key\n",
+            "whitelist.txt": "new.example\n",
+            "launcher.json": '{"new": true}\n',
+            "docker-run.sh": "#!/bin/sh\n# new\n",
+        }.items():
+            (self.config_dir / name).write_text(content)
+        (self.config_dir / "certs" / "fullchain.pem").write_text("NEWCERT\n")
+        (self.config_dir / "certs" / "privkey.pem").write_text("NEWKEY\n")
+
+    def test_restores_all_managed_files(self):
+        steps = dl.restore_backup_files(str(self.backup), str(self.config_dir))
+        self.assertTrue(steps[0]["ok"], steps[0])
+        self.assertEqual((self.config_dir / "config.yaml").read_text(), "old: true\n")
+        self.assertEqual((self.config_dir / "api-key").read_text(), "old-key\n")
+        self.assertEqual((self.config_dir / "whitelist.txt").read_text(), "old.example\n")
+        self.assertEqual((self.config_dir / "launcher.json").read_text(), "{}\n")
+        self.assertEqual((self.config_dir / "docker-run.sh").read_text(), "#!/bin/sh\n")
+        self.assertEqual(
+            (self.config_dir / "certs" / "fullchain.pem").read_text(), "CERT\n"
+        )
+        self.assertEqual((self.config_dir / "certs" / "privkey.pem").read_text(), "KEY\n")
+        self.assertEqual((self.config_dir / "config.yaml").stat().st_mode & 0o777, 0o600)
+        self.assertEqual((self.config_dir / "docker-run.sh").stat().st_mode & 0o777, 0o755)
+
+    def test_removes_files_that_did_not_exist_before(self):
+        (self.backup / "whitelist.txt").unlink()
+        (self.backup / "fullchain.pem").unlink()
+        (self.backup / "privkey.pem").unlink()
+        steps = dl.restore_backup_files(str(self.backup), str(self.config_dir))
+        self.assertTrue(steps[0]["ok"], steps[0])
+        self.assertFalse((self.config_dir / "whitelist.txt").exists())
+        self.assertFalse((self.config_dir / "certs" / "fullchain.pem").exists())
+        self.assertFalse((self.config_dir / "certs" / "privkey.pem").exists())
+
+    def test_reports_backup_failure(self):
+        steps = dl.restore_backup_files("", str(self.config_dir), "disk full")
+        self.assertFalse(steps[0]["ok"])
+        self.assertIn("disk full", steps[0]["detail"])
+
+    def test_no_backup_is_a_noop(self):
+        self.assertEqual(dl.restore_backup_files("", str(self.config_dir)), [])
+
+
+class DeployPreflightTest(unittest.TestCase):
+    def test_unmanaged_container_is_refused_before_writing(self):
+        tmp = Path(tempfile.mkdtemp())
+        raw = values_with(tmp, run_check=False, pull_latest=False)
+        with mock.patch.object(dl, "docker_state", lambda: {"ok": True}), \
+             mock.patch.object(
+                 dl,
+                 "container_state",
+                 lambda name: {"exists": True, "managed": False},
+             ), \
+             mock.patch.object(dl, "ensure_image") as ensure_image:
+            result = dl.deploy(raw, Path("/repo"), mode="deploy")
+        self.assertFalse(result["ok"])
+        self.assertIn("不是由本启动器创建", result["error"])
+        self.assertFalse((tmp / "etc" / "config.yaml").exists())
+        ensure_image.assert_not_called()
+
+
+class ReplaceContainerRollbackTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.values = dl.normalize_values(values_with(self.tmp))
+        self.config_dir = Path(self.values["config_dir"])
+        self.config_dir.mkdir(parents=True)
+        (self.config_dir / "config.yaml").write_text("new: true\n")
+        self.backup = self.tmp / "backup"
+        self.backup.mkdir()
+        (self.backup / "config.yaml").write_text("old: true\n")
+
+    def test_failed_start_restores_config_before_old_container(self):
+        def fake_run_cmd(args, **kwargs):
+            return {
+                "code": 0,
+                "args": args,
+                "output": "",
+                "stdout": "",
+                "stderr": "",
+                "duration": 0.0,
+            }
+
+        steps = []
+        with mock.patch.object(
+            dl,
+            "container_state",
+            lambda name: {"exists": True, "managed": True, "running": True},
+        ), mock.patch.object(dl, "run_cmd", fake_run_cmd), mock.patch.object(
+            dl,
+            "wait_container_start",
+            lambda name: ({"status": "exited", "restart_count": 0}, False),
+        ):
+            with self.assertRaises(dl.DeploymentError):
+                dl.replace_container(
+                    self.values,
+                    {"has_certs": False},
+                    steps,
+                    backup_dir=str(self.backup),
+                )
+
+        self.assertEqual((self.config_dir / "config.yaml").read_text(), "old: true\n")
+        names = [step["name"] for step in steps]
+        self.assertIn("恢复旧配置", names)
+        self.assertIn("回滚容器名", names)
+        self.assertIn("回滚启动旧容器", names)
+        self.assertLess(names.index("恢复旧配置"), names.index("回滚容器名"))
+        self.assertLess(names.index("回滚容器名"), names.index("回滚启动旧容器"))
+
+
 if __name__ == "__main__":
     unittest.main()

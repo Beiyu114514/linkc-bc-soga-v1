@@ -1087,6 +1087,7 @@ def prepare_files(values: dict[str, Any], existing: dict[str, Any], repo_root: P
             raise ValidationError(f"目录不可写 {directory}: {exc}")
 
     backup_dir: Path | None = None
+    backup_error = ""
     files_to_backup = [
         config_dir / CONFIG_FILENAME,
         config_dir / API_KEY_FILENAME,
@@ -1109,6 +1110,7 @@ def prepare_files(values: dict[str, Any], existing: dict[str, Any], repo_root: P
             for path in existing_files:
                 shutil.copy2(path, backup_dir / path.name)
         except OSError as exc:
+            backup_error = str(exc)
             warnings.append({"tone": "warn", "text": f"备份旧文件失败: {exc}"})
             backup_dir = None
 
@@ -1182,6 +1184,7 @@ def prepare_files(values: dict[str, Any], existing: dict[str, Any], repo_root: P
         "whitelist_path": str(whitelist_path),
         "cert_dir": str(certs_dir),
         "backup_dir": str(backup_dir) if backup_dir else "",
+        "backup_error": backup_error,
         "host_socket": str(run_dir / "admin.sock"),
         "warnings": warnings,
     }
@@ -1564,21 +1567,107 @@ def restore_container(
     steps: list[dict[str, Any]],
     *,
     start: bool,
-) -> None:
+) -> bool:
     if not backup_name:
-        return
+        return False
     result = run_cmd(["docker", "rename", backup_name, name], timeout=30)
     steps.append(make_step("回滚容器名", result))
-    if result["code"] != 0 or not start:
-        return
+    if result["code"] != 0:
+        return False
+    if not start:
+        return True
     result = run_cmd(["docker", "start", name], timeout=60)
     steps.append(make_step("回滚启动旧容器", result))
+    return result["code"] == 0
+
+
+def restore_backup_files(
+    backup_dir: str,
+    config_dir: str,
+    backup_error: str = "",
+) -> list[dict[str, Any]]:
+    """Put the pre-deploy files back after a failed container swap.
+
+    `prepare_files` saves every file it is about to overwrite into
+    `backups/<stamp>/`; a failed deploy must restore them before the old
+    container is started again, otherwise the old container reads the new
+    (possibly broken) config and fails too.
+    """
+    if not backup_dir:
+        if backup_error:
+            return [
+                {
+                    "name": "恢复旧配置",
+                    "ok": False,
+                    "detail": f"部署前备份失败，无法自动恢复: {backup_error}",
+                }
+            ]
+        return []
+
+    source = Path(backup_dir)
+    target = Path(config_dir)
+    if not source.is_dir():
+        return [
+            {
+                "name": "恢复旧配置",
+                "ok": False,
+                "detail": f"备份目录不存在: {source}",
+            }
+        ]
+
+    managed = [
+        (CONFIG_FILENAME, target / CONFIG_FILENAME, 0o600),
+        (API_KEY_FILENAME, target / API_KEY_FILENAME, 0o600),
+        (WHITELIST_FILENAME, target / WHITELIST_FILENAME, 0o600),
+        (METADATA_FILENAME, target / METADATA_FILENAME, 0o600),
+        (RUN_SCRIPT_FILENAME, target / RUN_SCRIPT_FILENAME, 0o755),
+        ("fullchain.pem", target / CERTS_DIRNAME / "fullchain.pem", 0o600),
+        ("privkey.pem", target / CERTS_DIRNAME / "privkey.pem", 0o600),
+    ]
+    restored: list[str] = []
+    removed: list[str] = []
+    errors: list[str] = []
+    for name, dest, mode in managed:
+        src = source / name
+        try:
+            if src.is_file():
+                atomic_write(dest, src.read_text(encoding="utf-8"), mode)
+                restored.append(dest.name)
+            elif dest.exists():
+                dest.unlink()
+                removed.append(dest.name)
+        except (OSError, UnicodeDecodeError) as exc:
+            errors.append(f"{dest.name}: {exc}")
+
+    if os.geteuid() == 0:
+        try:
+            chown_tree(target, 10001, 10001)
+        except OSError as exc:
+            errors.append(f"chown {target}: {exc}")
+
+    detail_parts: list[str] = []
+    if restored:
+        detail_parts.append("恢复 " + "、".join(restored))
+    if removed:
+        detail_parts.append("删除新增 " + "、".join(removed))
+    if errors:
+        detail_parts.append("失败: " + "；".join(errors[:3]))
+    return [
+        {
+            "name": "恢复旧配置",
+            "ok": not errors,
+            "detail": "；".join(detail_parts) or "没有需要恢复的文件",
+        }
+    ]
 
 
 def replace_container(
     values: dict[str, Any],
     existing: dict[str, Any],
     steps: list[dict[str, Any]],
+    *,
+    backup_dir: str = "",
+    backup_error: str = "",
 ) -> dict[str, Any]:
     """Swap the container, keeping the old one until the new one is stable."""
     name = values["container_name"]
@@ -1596,26 +1685,40 @@ def replace_container(
             result = run_cmd(["docker", "stop", name], timeout=60)
             steps.append(make_step("停止旧容器", result))
             if result["code"] != 0:
+                steps.extend(restore_backup_files(backup_dir, values["config_dir"], backup_error))
                 raise DeploymentError("停止旧容器失败", steps)
         backup_name = f"{name[:80]}-launcher-backup-{secrets.token_hex(3)}"
         result = run_cmd(["docker", "rename", name, backup_name], timeout=30)
         steps.append(make_step("暂存旧容器", result))
         if result["code"] != 0:
+            steps.extend(restore_backup_files(backup_dir, values["config_dir"], backup_error))
+            if was_running:
+                result = run_cmd(["docker", "start", name], timeout=60)
+                steps.append(make_step("回滚启动旧容器", result))
             raise DeploymentError("重命名旧容器失败", steps)
 
     result = run_cmd(docker_run_command(values, existing, check=False), timeout=120)
     steps.append(make_step("启动容器", result))
     if result["code"] != 0:
-        restore_container(name, backup_name, steps, start=was_running)
-        raise DeploymentError("启动容器失败，已回滚到旧容器", steps)
+        # A failed `docker run` can leave a container in Created state with
+        # the target name; remove it before renaming the old one back.
+        run_cmd(["docker", "rm", "-f", name], timeout=60)
+        steps.extend(restore_backup_files(backup_dir, values["config_dir"], backup_error))
+        restored = restore_container(name, backup_name, steps, start=was_running)
+        if backup_name:
+            message = "启动容器失败，已回滚到旧容器" if restored else "启动容器失败，旧容器恢复失败"
+        else:
+            message = "启动容器失败"
+        raise DeploymentError(message, steps)
 
     state, healthy = wait_container_start(name)
     if not healthy:
         run_cmd(["docker", "rm", "-f", name], timeout=60)
-        restore_container(name, backup_name, steps, start=was_running)
+        steps.extend(restore_backup_files(backup_dir, values["config_dir"], backup_error))
+        restored = restore_container(name, backup_name, steps, start=was_running)
         detail = f"状态 {state.get('status', 'unknown')}，重启 {state.get('restart_count') or 0} 次"
         if backup_name:
-            detail += f"；旧容器已回滚（暂存名 {backup_name}）"
+            detail += "；旧容器已恢复" if restored else "；旧容器恢复失败，请查看步骤"
         raise DeploymentError(f"容器未稳定运行（{detail}）", steps)
 
     if backup_name:
@@ -1635,6 +1738,8 @@ def deploy(raw_values: Any, repo_root: Path, mode: str = "deploy") -> dict[str, 
             steps.append({"name": "写入配置", "ok": True, "detail": paths["config_path"]})
             if paths.get("backup_dir"):
                 steps.append({"name": "备份旧文件", "ok": True, "detail": paths["backup_dir"]})
+            elif paths.get("backup_error"):
+                steps.append({"name": "备份旧文件", "ok": False, "detail": paths["backup_error"]})
             return {
                 "ok": True,
                 "mode": mode,
@@ -1648,6 +1753,18 @@ def deploy(raw_values: Any, repo_root: Path, mode: str = "deploy") -> dict[str, 
         docker = docker_state()
         if not docker.get("ok"):
             raise ValidationError(f"Docker 不可用：{docker.get('error', '未知错误')}")
+
+        # Refuse an unmanaged container before writing anything: otherwise a
+        # deploy that is going to be rejected would still overwrite the config
+        # that container may be using.  `check` does not touch the container,
+        # so it stays available for validation.
+        if mode == "deploy":
+            container = container_state(values["container_name"])
+            if container.get("exists") and not container.get("managed"):
+                raise ValidationError(
+                    f"同名容器 {values['container_name']} 已存在，但不是由本启动器创建；"
+                    "请更换名称或手动删除"
+                )
 
         # Pull/build before anything is written: a failed pull must not replace
         # the config the running node depends on.
@@ -1671,8 +1788,16 @@ def deploy(raw_values: Any, repo_root: Path, mode: str = "deploy") -> dict[str, 
         steps.append({"name": "写入配置", "ok": True, "detail": paths["config_path"]})
         if paths.get("backup_dir"):
             steps.append({"name": "备份旧文件", "ok": True, "detail": paths["backup_dir"]})
+        elif paths.get("backup_error"):
+            steps.append({"name": "备份旧文件", "ok": False, "detail": paths["backup_error"]})
 
-        state = replace_container(values, existing, steps)
+        state = replace_container(
+            values,
+            existing,
+            steps,
+            backup_dir=paths.get("backup_dir", ""),
+            backup_error=paths.get("backup_error", ""),
+        )
 
         logs_result = run_cmd(
             ["docker", "logs", "--tail", "80", values["container_name"]],
