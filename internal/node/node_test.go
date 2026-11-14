@@ -27,6 +27,7 @@ func TestSpecLocalRealityOverrides(t *testing.T) {
 	s := Spec{NodeType: "vless", Config: panel.Config{
 		Port: 443, StreamType: "tcp", TLSType: "reality",
 		PrivateKey: "priv", ServerNames: []string{"a.example.com"}, Dest: "a.example.com:443", XVER: 1,
+		ShortIDs: []string{""},
 	}}
 	xc, err := s.Xray(LocalRuntime{Listen: "127.0.0.1", RealityXVER: 2, MLDSA65Seed: seed})
 	if err != nil {

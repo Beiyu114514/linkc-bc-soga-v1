@@ -29,6 +29,9 @@ type Checker struct {
 
 	resolveMu    sync.Mutex
 	resolveCache map[string]resolveEntry
+	// lookupIP is net.DefaultResolver.LookupIP; tests replace it to exercise
+	// resolver failures deterministically.
+	lookupIP func(ctx context.Context, network, host string) ([]net.IP, error)
 }
 
 type resolveEntry struct {
@@ -52,7 +55,7 @@ func New(st *store.Store, cfg Config, log *slog.Logger) *Checker {
 	if cfg.Action == "" {
 		cfg.Action = "block"
 	}
-	c := &Checker{cfg: cfg, st: st, log: log}
+	c := &Checker{cfg: cfg, st: st, log: log, lookupIP: net.DefaultResolver.LookupIP}
 	c.rules, _, _ = Compile(nil, nil, cfg)
 	return c
 }
@@ -62,9 +65,13 @@ func (c *Checker) Update(raw []panel.AuditRule, white []string) (Stats, error) {
 	if c.cfg.GeodataDir != "" && c.geo == nil && needsGeodata(raw, white) {
 		geo, err := LoadGeodata(c.cfg.GeodataDir)
 		if err != nil {
+			// LoadGeodata returns a partially filled (or empty) GeoData together
+			// with the error. Caching it would disable geo rules until restart,
+			// so keep c.geo nil and retry on the next Update.
 			c.log.Warn("load geodata", "dir", c.cfg.GeodataDir, "error", err)
+		} else {
+			c.geo = geo
 		}
-		c.geo = geo
 	}
 	cfg := c.cfg
 	cfg.Geo = c.geo
@@ -105,12 +112,20 @@ func (c *Checker) Check(ctx context.Context, userID int64, dest xnet.Destination
 	var ruleID int64
 	var white, ok bool
 	if ip == nil && domain != "" && c.cfg.ResolveDomain && rules.HasIPRules() {
+		matched := false
 		for _, candidate := range c.resolve(domain) {
 			ruleID, white, ok = rules.Match(domain, candidate, int(dest.Port))
 			if ok {
 				ip = candidate
+				matched = true
 				break
 			}
+		}
+		if !matched {
+			// DNS failed or no IP rule matched: still consult the domain,
+			// keyword, regexp and port rules. Skipping them here would turn a
+			// resolver outage into an audit bypass (fail-open).
+			ruleID, white, ok = rules.Match(domain, nil, int(dest.Port))
 		}
 	} else {
 		ruleID, white, ok = rules.Match(domain, ip, int(dest.Port))
@@ -189,29 +204,52 @@ func target(dest xnet.Destination) (string, net.IP) {
 	return domain, nil
 }
 
+const (
+	resolveTTL         = time.Minute
+	resolveNegativeTTL = 30 * time.Second
+	resolveMaxEntries  = 10000
+)
+
+// resolve looks up a domain, caching both hits and failures. Negative caching
+// keeps a broken resolver from costing every connection a full timeout.
 func (c *Checker) resolve(domain string) []net.IP {
 	c.resolveMu.Lock()
-	if e, ok := c.resolveCache[domain]; ok && time.Since(e.at) < time.Minute {
-		c.resolveMu.Unlock()
-		return e.ips
+	if e, ok := c.resolveCache[domain]; ok {
+		ttl := resolveTTL
+		if len(e.ips) == 0 {
+			ttl = resolveNegativeTTL
+		}
+		if time.Since(e.at) < ttl {
+			c.resolveMu.Unlock()
+			return e.ips
+		}
 	}
 	c.resolveMu.Unlock()
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	ips, err := net.DefaultResolver.LookupIP(ctx, "ip", domain)
+	lookup := c.lookupIP
+	if lookup == nil {
+		lookup = net.DefaultResolver.LookupIP
+	}
+	ips, err := lookup(ctx, "ip", domain)
 	if err != nil || len(ips) == 0 {
+		c.cacheResolve(domain, nil)
 		return nil
 	}
+	c.cacheResolve(domain, ips)
+	return ips
+}
+
+func (c *Checker) cacheResolve(domain string, ips []net.IP) {
 	c.resolveMu.Lock()
+	defer c.resolveMu.Unlock()
 	if c.resolveCache == nil {
 		c.resolveCache = make(map[string]resolveEntry)
 	}
-	if len(c.resolveCache) > 10000 {
+	if len(c.resolveCache) > resolveMaxEntries {
 		c.resolveCache = make(map[string]resolveEntry)
 	}
 	c.resolveCache[domain] = resolveEntry{ips: ips, at: time.Now()}
-	c.resolveMu.Unlock()
-	return ips
 }
 
 func ipString(ip net.IP) string {

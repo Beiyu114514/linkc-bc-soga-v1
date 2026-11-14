@@ -3,11 +3,13 @@ package panel
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/Beiyu114514/linkc-bc-soga-v1/internal/m0/mockpanel"
 	"github.com/Beiyu114514/linkc-bc-soga-v1/internal/store"
@@ -117,3 +119,75 @@ func TestRetryAndErrors(t *testing.T) {
 
 // timeMillisecond avoids importing time in the test body above.
 const timeMillisecond = 1_000_000
+
+// failingCache simulates a read-only or full state DB.
+type failingCache struct{}
+
+func (failingCache) GetETag(string) (store.ETagRecord, bool, error) {
+	return store.ETagRecord{}, false, nil
+}
+
+func (failingCache) PutETag(string, store.ETagRecord) error {
+	return errors.New("database is read-only")
+}
+
+// TestCacheWriteFailureKeepsResponse guards #9: a cache write failure must not
+// turn a valid panel response into a fetch error (dump-config opens the state
+// DB read-only, and a full disk must not stop config updates).
+func TestCacheWriteFailureKeepsResponse(t *testing.T) {
+	p := mockpanel.New(mockpanel.Config{
+		APIKey: "key", NodeID: 7, NodeType: "vless",
+		Port: 443, StreamType: "tcp", TLSType: "none", TrafficRate: 1,
+		PullInterval: -1, PushInterval: -1,
+	})
+	p.SetUsers(mockpanel.User{ID: 1, UUID: "701534e1-8540-49f3-87af-71680a1b97ff", TransferEnable: 1 << 40, Enable: true})
+	srv := httptest.NewServer(p)
+	defer srv.Close()
+	c, err := New(Options{BaseURL: srv.URL, APIKey: "key", NodeID: "7", NodeType: "vless",
+		AllowHTTP: true, MaxAttempts: 1}, failingCache{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	n, changed, err := c.FetchNode(context.Background())
+	if err != nil {
+		t.Fatalf("cache write failure must not fail the fetch: %v", err)
+	}
+	if !changed || n.Config.Port != 443 {
+		t.Fatalf("node=%+v changed=%v", n, changed)
+	}
+}
+
+// TestRetryAfterIsBounded guards #11: the panel controls Retry-After, so a
+// huge value must not stall config apply.
+func TestRetryAfterIsBounded(t *testing.T) {
+	if got := clampRetryAfter(3600 * time.Second); got != maxRetryAfterWait {
+		t.Fatalf("clamp(1h) = %v, want %v", got, maxRetryAfterWait)
+	}
+	if got := clampRetryAfter(5 * time.Second); got != 5*time.Second {
+		t.Fatalf("clamp(5s) = %v", got)
+	}
+	if got := retryAfter("3600"); got != 3600*time.Second {
+		t.Fatalf("retryAfter = %v", got)
+	}
+}
+
+// Test429DoesNotSleepOnLastAttempt guards the second half of #11: the final
+// attempt must return immediately instead of sleeping the full Retry-After.
+func Test429DoesNotSleepOnLastAttempt(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Retry-After", "5")
+		http.Error(w, "slow down", http.StatusTooManyRequests)
+	}))
+	defer srv.Close()
+	c, err := New(Options{BaseURL: srv.URL, APIKey: "k", NodeID: "1", AllowHTTP: true, MaxAttempts: 1}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	start := time.Now()
+	if _, _, err := c.FetchNode(context.Background()); err == nil {
+		t.Fatal("expected a 429 error")
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("last attempt slept for %v", elapsed)
+	}
+}

@@ -30,13 +30,14 @@ func newAliveTracker(fullEach int, mode string) *aliveTracker {
 	return &aliveTracker{last: make(map[int64]string), fullEach: fullEach, mode: mode}
 }
 
-// diff returns the batches to send and remembers the new snapshot.
-func (t *aliveTracker) diff(current map[int64][]string) []panel.AliveIP {
+// pending returns the batches to send without recording them. The snapshot is
+// only committed by commit, after the push succeeded, so a failed POST is
+// retried on the next tick instead of waiting for the next full snapshot.
+func (t *aliveTracker) pending(current map[int64][]string) (batch []panel.AliveIP, full bool) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	t.pushes++
-	full := t.mode == "full" || t.pushes%t.fullEach == 0
-	var out []panel.AliveIP
+	full = t.mode == "full" || t.pushes%t.fullEach == 0
 	for id, ips := range current {
 		if len(ips) == 0 {
 			continue
@@ -45,18 +46,31 @@ func (t *aliveTracker) diff(current map[int64][]string) []panel.AliveIP {
 		if !full && t.last[id] == key {
 			continue
 		}
-		t.last[id] = key
-		out = append(out, panel.AliveIP{ID: id, IPs: append([]string(nil), ips...)})
+		batch = append(batch, panel.AliveIP{ID: id, IPs: append([]string(nil), ips...)})
+	}
+	sort.Slice(batch, func(i, j int) bool { return batch[i].ID < batch[j].ID })
+	return batch, full
+}
+
+// commit records the snapshot that was just delivered.
+func (t *aliveTracker) commit(current map[int64][]string, full bool) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	for id, ips := range current {
+		if len(ips) == 0 {
+			continue
+		}
+		t.last[id] = ipKey(ips)
 	}
 	// Drop users that are no longer online from the local cache so their
 	// next appearance is sent again.
-	for id := range t.last {
-		if _, ok := current[id]; !ok && full {
-			delete(t.last, id)
+	if full {
+		for id := range t.last {
+			if _, ok := current[id]; !ok {
+				delete(t.last, id)
+			}
 		}
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
-	return out
 }
 
 func ipKey(ips []string) string {
@@ -74,9 +88,17 @@ func (a *Agent) pushAliveIP(ctx context.Context) error {
 	if engine == nil || tracker == nil {
 		return nil
 	}
-	batch := tracker.diff(engine.OnlineIPs())
+	current := engine.OnlineIPs()
+	batch, full := tracker.pending(current)
 	if len(batch) == 0 {
+		// Nothing to send; still apply the snapshot so offline users are
+		// dropped from the cache on a full pass.
+		tracker.commit(current, full)
 		return nil
 	}
-	return a.panel.PushAliveIP(ctx, batch)
+	if err := a.panel.PushAliveIP(ctx, batch); err != nil {
+		return err
+	}
+	tracker.commit(current, full)
+	return nil
 }

@@ -183,9 +183,16 @@ func ValidateConfig(node NodeConfig) error {
 			return fmt.Errorf("reality dest must be host:port: %w", err)
 		}
 	}
+	if tlsType == "reality" && len(node.ShortIDs) == 0 {
+		// Xray rejects an empty shortIds list for REALITY ("empty shortIds").
+		return fmt.Errorf("reality requires at least one short_id")
+	}
 	for _, sid := range node.ShortIDs {
-		if len(sid) == 0 || len(sid) > 16 || len(sid)%2 != 0 {
-			return fmt.Errorf("invalid short_id %q", sid)
+		// An empty string is a valid, commonly used "disable shortId" value:
+		// Xray hex-decodes it into an all-zero 8-byte id. Odd lengths and
+		// non-hex characters are rejected by hex.DecodeString itself.
+		if len(sid) > 16 {
+			return fmt.Errorf("invalid short_id %q: too long", sid)
 		}
 		if _, err := hex.DecodeString(sid); err != nil {
 			return fmt.Errorf("invalid short_id %q: %w", sid, err)

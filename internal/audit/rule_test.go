@@ -1,6 +1,7 @@
 package audit
 
 import (
+	"context"
 	"net"
 	"os"
 	"path/filepath"
@@ -197,5 +198,144 @@ func TestResolveDomainForIPRule(t *testing.T) {
 	dest := xnet.TCPDestination(xnet.DomainAddress("localhost"), 443)
 	if !c.Check(nil, 1, dest) {
 		t.Fatal("resolved localhost should match ip rule")
+	}
+}
+
+// TestEmptyRulesRejected guards #3: a blank rule used to compile to keyword ""
+// which matches every domain, blocking (or flooding) the whole node.
+func TestEmptyRulesRejected(t *testing.T) {
+	for _, rule := range []string{"", "   ", "\t\n", "keyword:", "regexp:", "domain:", "full:", "ip:", "port:"} {
+		r, stats, err := Compile([]panel.AuditRule{{ID: 1, Rule: rule}}, nil, Config{Mode: "auto"})
+		if err != nil {
+			t.Fatalf("%q: unexpected error: %v", rule, err)
+		}
+		if stats.Compiled != 0 || stats.Skipped != 1 || r.Len() != 0 {
+			t.Fatalf("%q compiled into a matcher: %+v", rule, stats)
+		}
+		if _, white, ok := r.Match("anything.test", nil, 443); ok || white {
+			t.Fatalf("%q matched everything", rule)
+		}
+	}
+	if _, _, err := Compile([]panel.AuditRule{{ID: 1, Rule: "   "}}, nil, Config{Mode: "auto", Strict: true}); err == nil {
+		t.Fatal("strict mode must reject a blank rule")
+	}
+	// The whitelist side must not turn into "allow everything" either.
+	r, _, err := Compile(nil, []string{"keyword:", "  "}, Config{Mode: "auto"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, white, ok := r.Match("anything.test", nil, 443); ok || white {
+		t.Fatal("blank whitelist entry matched everything")
+	}
+}
+
+// TestCheckDNSFailureDoesNotBypassDomainRules guards #1: a resolver outage used
+// to skip every non-IP rule, letting blocked domains through.
+func TestCheckDNSFailureDoesNotBypassDomainRules(t *testing.T) {
+	st, err := store.Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	c := New(st, Config{Mode: "auto", Action: "block", DedupeTTL: time.Hour, ResolveDomain: true}, nil)
+	c.lookupIP = func(context.Context, string, string) ([]net.IP, error) {
+		return nil, &net.DNSError{Err: "no such host", Name: "www.blocked.test", IsNotFound: true}
+	}
+	if _, err := c.Update([]panel.AuditRule{
+		{ID: 1, Rule: "ip:203.0.113.0/24"},
+		{ID: 2, Rule: "keyword:blocked"},
+	}, nil); err != nil {
+		t.Fatal(err)
+	}
+	dest := xnet.TCPDestination(xnet.DomainAddress("www.blocked.test"), 443)
+	if !c.Check(nil, 1, dest) {
+		t.Fatal("keyword rule must still block when DNS resolution fails")
+	}
+	pending, err := st.PendingAudit(10)
+	if err != nil || len(pending) != 1 || pending[0].RuleID != 2 {
+		t.Fatalf("pending=%+v err=%v", pending, err)
+	}
+}
+
+// TestResolveNegativeCache guards the DNS negative cache: a broken resolver
+// must not cost every connection a full timeout.
+func TestResolveNegativeCache(t *testing.T) {
+	c := New(nil, Config{}, nil)
+	var calls int
+	c.lookupIP = func(context.Context, string, string) ([]net.IP, error) {
+		calls++
+		return nil, &net.DNSError{Err: "timeout", IsTimeout: true}
+	}
+	for i := 0; i < 3; i++ {
+		if ips := c.resolve("blocked.test"); ips != nil {
+			t.Fatalf("unexpected IPs: %v", ips)
+		}
+	}
+	if calls != 1 {
+		t.Fatalf("negative result not cached: %d lookups", calls)
+	}
+}
+
+// TestWhitelistIPOnlyResolves guards #7: a whitelist made only of IP rules must
+// still trigger DNS resolution, otherwise the target is blocked.
+func TestWhitelistIPOnlyResolves(t *testing.T) {
+	st, err := store.Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	c := New(st, Config{Mode: "auto", Action: "block", DedupeTTL: time.Hour, ResolveDomain: true}, nil)
+	c.lookupIP = func(context.Context, string, string) ([]net.IP, error) {
+		return []net.IP{net.ParseIP("203.0.113.5")}, nil
+	}
+	if _, err := c.Update([]panel.AuditRule{{ID: 1, Rule: "keyword:example"}}, []string{"ip:203.0.113.5"}); err != nil {
+		t.Fatal(err)
+	}
+	if !c.Rules().HasIPRules() {
+		t.Fatal("whitelist-only ip rule must set hasIP")
+	}
+	dest := xnet.TCPDestination(xnet.DomainAddress("example.com"), 443)
+	if c.Check(nil, 1, dest) {
+		t.Fatal("whitelisted target must not be blocked")
+	}
+}
+
+// TestGeoDataRetriedAfterFailure guards #12: a failed load must not be cached,
+// so installing geodata later makes the rules work without a restart.
+func TestGeoDataRetriedAfterFailure(t *testing.T) {
+	st, err := store.Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	dir := t.TempDir()
+	c := New(st, Config{Mode: "auto", Action: "block", DedupeTTL: time.Hour, GeodataDir: dir}, nil)
+	rules := []panel.AuditRule{{ID: 1, Rule: "geoip:testip"}}
+	if stats, err := c.Update(rules, nil); err != nil {
+		t.Fatal(err)
+	} else if stats.Compiled != 0 || stats.Skipped != 1 {
+		t.Fatalf("geo rule should be skipped without geodata: %+v", stats)
+	}
+	ips, _ := proto.Marshal(&xgeodata.GeoIPList{Entry: []*xgeodata.GeoIP{{
+		Code: "TESTIP",
+		Cidr: []*xgeodata.CIDR{{Ip: []byte{10, 0, 0, 0}, Prefix: 8}},
+	}}})
+	if err := os.WriteFile(filepath.Join(dir, "geoip.dat"), ips, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// LoadGeodata refuses to return a partial set, so geosite.dat is required
+	// even though only a geoip rule is used.
+	sites, _ := proto.Marshal(&xgeodata.GeoSiteList{Entry: []*xgeodata.GeoSite{{
+		Code:   "TEST",
+		Domain: []*xgeodata.Domain{{Type: xgeodata.Domain_Full, Value: "example.test"}},
+	}}})
+	if err := os.WriteFile(filepath.Join(dir, "geosite.dat"), sites, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.Update(rules, nil); err != nil {
+		t.Fatalf("geodata should be reloaded after it appears: %v", err)
+	}
+	if id, _, ok := c.Rules().Match("", net.ParseIP("10.1.2.3"), 443); !ok || id != 1 {
+		t.Fatalf("geoip rule not active: id=%d ok=%v", id, ok)
 	}
 }

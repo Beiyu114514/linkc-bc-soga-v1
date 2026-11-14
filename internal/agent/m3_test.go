@@ -87,3 +87,26 @@ func TestWhitelistFileReloadsWithoutPanelChange(t *testing.T) {
 		return false
 	})
 }
+
+// TestAuditUpdateRetriedAfterPartialFetchFailure guards #2: when one audit
+// endpoint fails, the other one's ETag has already advanced. The next pull
+// answers 304 for both, which used to hide the fetched rule version forever.
+func TestAuditUpdateRetriedAfterPartialFetchFailure(t *testing.T) {
+	nodePort := freePort(t)
+	p, srv := startPanel(t, nodePort)
+	defer srv.Close()
+	p.SetRules(mockpanel.Rule{ID: 1, Regex: "keyword:one"})
+	cfg := testConfig(t, srv.URL, t.TempDir())
+	a, stop, _ := startAgent(t, cfg)
+	defer stop()
+
+	waitFor(t, "first rule set", func() bool { return a.Snapshot().AuditRules == 1 })
+
+	// New rules arrive, but the whitelist fetch fails on the same pull, so the
+	// update cannot be applied while the audit_rules ETag moves forward.
+	p.SetRules(mockpanel.Rule{ID: 1, Regex: "keyword:one"}, mockpanel.Rule{ID: 2, Regex: "keyword:two"})
+	p.SetFault("/api/v1/white_list", 500, 1)
+
+	// The retry pull only sees 304s; the update must still be applied.
+	waitFor(t, "audit rule update retried", func() bool { return a.Snapshot().AuditRules == 2 })
+}
