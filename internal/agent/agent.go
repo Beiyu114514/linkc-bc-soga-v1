@@ -74,6 +74,10 @@ type Agent struct {
 	hasNode     bool
 	hasUsers    bool
 	auditLoaded bool
+	// auditPending records that a fetched rule/whitelist version was not
+	// applied yet. The panel client advances its ETag cache on 200, so the
+	// next pull answers 304 and would otherwise never retry the update.
+	auditPending bool
 
 	pullEvery    time.Duration
 	collectEvery time.Duration
@@ -87,6 +91,11 @@ type Agent struct {
 	lastOK    map[string]time.Time
 	lastErr   error
 	startedAt time.Time
+
+	// stopped is set by shutdown() while holding applyMu. ReloadCerts (SIGHUP)
+	// re-checks it after taking applyMu, so a certificate reload can never
+	// outlive the Xray engine that shutdown() closes.
+	stopped bool
 
 	applyMu   sync.Mutex
 	collectMu sync.Mutex
@@ -223,22 +232,26 @@ func (a *Agent) Bootstrap(ctx context.Context) error {
 			}
 		}
 		if haveRules || haveWhite {
-			if _, err := a.audit.Update(rawRules, a.mergeWhiteList(rawWhite)); err != nil {
+			if _, err := a.audit.Update(rawRules, mergeWhiteList(rawWhite, a.localWhite)); err != nil {
 				a.log.Warn("bootstrap audit compile", "error", err)
 			} else {
-				a.mu.Lock()
-				a.auditLoaded = true
-				a.mu.Unlock()
-			}
-		}
-		if haveRules {
-			if err := a.store.PutLastGood(a.lastGood("audit_rules"), rawRules); err != nil {
-				a.log.Warn("save last_good audit_rules", "error", err)
-			}
-		}
-		if haveWhite {
-			if err := a.store.PutLastGood(a.lastGood("white_list"), rawWhite); err != nil {
-				a.log.Warn("save last_good white_list", "error", err)
+				// auditLoaded stays false on purpose: the rules above may come
+				// from last_good while the ETag cache already holds a newer body
+				// (e.g. a restart between a failed pull and its retry). Leaving
+				// it false makes the first successful Sync reconcile the audit
+				// set instead of trusting last_good forever.
+				// Persist only what is actually live, like Sync does: a failed
+				// compile must not let last_good lead the applied rules.
+				if haveRules {
+					if err := a.store.PutLastGood(a.lastGood("audit_rules"), rawRules); err != nil {
+						a.log.Warn("save last_good audit_rules", "error", err)
+					}
+				}
+				if haveWhite {
+					if err := a.store.PutLastGood(a.lastGood("white_list"), rawWhite); err != nil {
+						a.log.Warn("save last_good white_list", "error", err)
+					}
+				}
 			}
 		}
 	}
@@ -416,6 +429,13 @@ func (a *Agent) commitNode(spec node.Spec, xc xray.NodeConfig, users []xray.User
 func (a *Agent) ReloadCerts() error {
 	a.applyMu.Lock()
 	defer a.applyMu.Unlock()
+	a.mu.Lock()
+	if a.closed || a.stopped {
+		// Shutdown already closed the store and engine; nothing to reload.
+		a.mu.Unlock()
+		return nil
+	}
+	a.mu.Unlock()
 	certs, err := loadCertMaterials(a.cfg.Node.TLS.Certificates)
 	if err != nil {
 		return err
@@ -620,6 +640,14 @@ func (a *Agent) setApplyError(err error) {
 	a.mu.Unlock()
 }
 
+// setAuditPending marks whether a fetched audit rule set still has to be
+// applied. See the auditPending field for why this is needed.
+func (a *Agent) setAuditPending(pending bool) {
+	a.mu.Lock()
+	a.auditPending = pending
+	a.mu.Unlock()
+}
+
 func (a *Agent) updateDegradedLocked() {
 	a.degraded = a.failures["node"] >= 3 || a.failures["users"] >= 3
 }
@@ -641,6 +669,17 @@ func (a *Agent) interval(kind string) time.Duration {
 }
 
 func (a *Agent) shutdown() {
+	// Run() returns only after this function, so the SIGHUP goroutine in
+	// cmd/linkc-node is joined *after* the engine is already closed. Serialize
+	// with ReloadCerts instead: it holds applyMu for its whole run and
+	// re-checks the stop flag once it has the lock, so the engine is never
+	// closed underneath an in-flight inbound swap.
+	a.applyMu.Lock()
+	a.mu.Lock()
+	a.stopped = true
+	a.mu.Unlock()
+	defer a.applyMu.Unlock()
+
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	a.collect(ctx)
@@ -760,8 +799,15 @@ func (a *Agent) collect(ctx context.Context) {
 	if tm == nil {
 		return
 	}
-	if max := a.cfg.Storage.MaxJournalBytes; max > 0 && tm.PendingBytes() > max {
-		a.log.Error("traffic journal is full; collection paused", "pending_bytes", tm.PendingBytes())
+	// Flush the in-memory backlog first: the size guard must only look at the
+	// durable journal. Counting mem here used to freeze the pipeline forever
+	// (mem kept the guard tripped, so Collect never flushed it, and Push
+	// refused to drain the journal while mem was non-empty).
+	if err := tm.FlushMem(); err != nil {
+		a.log.Error("flush traffic backlog", "error", err, "pending_bytes", tm.PendingBytes())
+	}
+	if max := a.cfg.Storage.MaxJournalBytes; max > 0 && tm.JournalBytes() > max {
+		a.log.Error("traffic journal is full; collection paused", "journal_bytes", tm.JournalBytes(), "pending_bytes", tm.PendingBytes())
 		return
 	}
 	if n, err := tm.Collect(); err != nil {
@@ -776,6 +822,11 @@ func (a *Agent) Push(ctx context.Context) error {
 	a.mu.Unlock()
 	var firstErr error
 	if tm != nil {
+		if pending, journal := tm.PendingBytes(), tm.JournalBytes(); pending > journal {
+			// Not fatal: unjournaled deltas are newer than the journal and do
+			// not conflict with pushing the durable records.
+			a.log.Warn("traffic backlog is not journaled yet", "pending_bytes", pending, "journal_bytes", journal)
+		}
 		if n, err := tm.Push(ctx, a.panel, a.cfg.Node.Traffic.BatchUsers, a.cfg.Node.Traffic.BatchBytes); err != nil {
 			firstErr = err
 			a.setApplyError(err)
@@ -862,14 +913,11 @@ func newAuditChecker(st *store.Store, cfg config.Config, log *slog.Logger) *audi
 	}, log)
 }
 
-// mergeWhiteList combines the panel list with the local whitelist file.
-func (a *Agent) mergeWhiteList(fromPanel []string) []string {
+// mergeWhiteList combines the panel list with the effective local whitelist
+// file contents.
+func mergeWhiteList(fromPanel, local []string) []string {
 	out := append([]string(nil), fromPanel...)
-	if a.localWhite == nil {
-		return out
-	}
-	out = append(out, a.localWhite...)
-	return out
+	return append(out, local...)
 }
 
 // loadWhiteList reads a newline-separated whitelist file (“#“ comments and

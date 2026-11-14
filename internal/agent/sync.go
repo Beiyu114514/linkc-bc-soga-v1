@@ -24,6 +24,7 @@ func (a *Agent) Sync(ctx context.Context) error {
 	curXC := a.xrayCfg
 	curInboundFP := a.inboundFP
 	auditLoaded := a.auditLoaded
+	auditPending := a.auditPending
 	a.mu.Unlock()
 	if engine == nil {
 		return fmt.Errorf("agent is not bootstrapped")
@@ -77,6 +78,13 @@ func (a *Agent) Sync(ctx context.Context) error {
 			rawWhite, whiteChanged = white, wChanged
 		}
 		auditOK = rErr == nil && wErr == nil
+		if !auditOK && (rulesChanged || whiteChanged) {
+			// A newer version was fetched but cannot be applied because the
+			// other endpoint failed. Remember it: the advanced ETag makes the
+			// next pull answer 304, which would otherwise skip the update for
+			// good. The cached body still fills rawRules/rawWhite on that pull.
+			a.setAuditPending(true)
+		}
 	}
 
 	spec := curSpec
@@ -199,33 +207,51 @@ func (a *Agent) Sync(ctx context.Context) error {
 		// The local whitelist file may have changed on disk; reload it on every
 		// pull so edits take effect even when the panel answers 304.
 		localChanged := false
+		var local []string
 		if a.cfg.Node.Audit.WhiteListFile != "" {
-			if local, err := loadWhiteList(a.cfg.Node.Audit.WhiteListFile); err != nil {
+			if l, err := loadWhiteList(a.cfg.Node.Audit.WhiteListFile); err != nil {
 				a.log.Warn("reload whitelist", "error", err)
-			} else if !equalStrings(a.localWhite, local) {
-				a.localWhite = local
-				localChanged = true
+			} else if !equalStrings(a.localWhite, l) {
+				local, localChanged = l, true
 			}
 		}
-		if rulesChanged || whiteChanged || localChanged || !auditLoaded {
-			if rulesChanged {
-				if err := a.store.PutLastGood(a.lastGood("audit_rules"), rawRules); err != nil {
-					a.log.Warn("save last_good audit_rules", "error", err)
-				}
+		if rulesChanged || whiteChanged || localChanged || !auditLoaded || auditPending {
+			// Merge against the whitelist that will be live after this update,
+			// not the one still in a.localWhite: the latter is only advanced on
+			// success, and a stale merge would never be retried.
+			effective := a.localWhite
+			if localChanged {
+				effective = local
 			}
-			if whiteChanged {
-				if err := a.store.PutLastGood(a.lastGood("white_list"), rawWhite); err != nil {
-					a.log.Warn("save last_good white_list", "error", err)
-				}
-			}
-			merged := a.mergeWhiteList(rawWhite)
+			merged := mergeWhiteList(rawWhite, effective)
 			stats, err := a.audit.Update(rawRules, merged)
 			if err != nil {
 				rulesErr = errors.Join(rulesErr, fmt.Errorf("apply audit rules: %w", err))
 				a.setApplyError(err)
+				// Retry on the next pull: the fetched version is not live yet.
+				a.setAuditPending(true)
 			} else {
+				// Only advance the local whitelist once the new set is live, so it
+				// never leads the applied rules.
+				if localChanged {
+					a.localWhite = local
+				}
+				// Persist the version that is actually live, not just the one that
+				// changed in this pull: a retried update sees changed=false because
+				// the ETag already advanced, and gating the write on changed would
+				// leave last_good behind. A restart would then replay the older
+				// set and the newer cached body would never be applied again.
+				// auditOK guarantees both fetches succeeded, so rawRules/rawWhite
+				// hold the applied version (fresh body or 304 cache).
+				if err := a.store.PutLastGood(a.lastGood("audit_rules"), rawRules); err != nil {
+					a.log.Warn("save last_good audit_rules", "error", err)
+				}
+				if err := a.store.PutLastGood(a.lastGood("white_list"), rawWhite); err != nil {
+					a.log.Warn("save last_good white_list", "error", err)
+				}
 				a.mu.Lock()
 				a.auditLoaded = true
+				a.auditPending = false
 				a.mu.Unlock()
 				if stats.Compiled > 0 || stats.Skipped > 0 {
 					a.log.Info("audit rules applied", "compiled", stats.Compiled, "skipped", stats.Skipped)

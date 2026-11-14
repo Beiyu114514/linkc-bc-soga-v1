@@ -932,13 +932,17 @@ func (g *Gate) Before(ctx context.Context, link *transport.Link) bool {
 		return false
 	}
 	device := deviceKey(src, g.devicePrefix)
-	if g.mode == "enforce" && u.DeviceLimit > 0 && device != "" {
+	if u.DeviceLimit > 0 && device != "" {
+		// Track devices in every non-off mode: After() already decrements
+		// unconditionally, and gating the bookkeeping on enforce left the
+		// device metrics at zero in report mode, which made the mode useless
+		// for evaluating a limit before enabling it.
 		set := g.deviceRefs[id]
 		if set == nil {
 			set = make(map[string]int)
 			g.deviceRefs[id] = set
 		}
-		if set[device] == 0 && len(set) >= u.DeviceLimit {
+		if g.mode == "enforce" && set[device] == 0 && len(set) >= u.DeviceLimit {
 			g.rejectsDevice++
 			g.mu.Unlock()
 			return false
@@ -1129,7 +1133,10 @@ func (r *rateReader) ReadMultiBuffer() (buf.MultiBuffer, error) {
 		return mb, err
 	}
 	if err := waitLimits(r.ctx, r.lims, int(mb.Len())); err != nil {
-		return mb, err
+		// Cancelled while throttling: drop the frame instead of letting
+		// copyInternal forward it after the cancellation.
+		buf.ReleaseMulti(mb)
+		return nil, err
 	}
 	return mb, nil
 }
@@ -1143,6 +1150,10 @@ type rateWriter struct {
 func (w *rateWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
 	if !mb.IsEmpty() {
 		if err := waitLimits(w.ctx, w.lims, int(mb.Len())); err != nil {
+			// WriteMultiBuffer takes ownership of the buffer, so it must be
+			// released here: copyInternal returns on a write error without
+			// releasing it.
+			buf.ReleaseMulti(mb)
 			return err
 		}
 	}

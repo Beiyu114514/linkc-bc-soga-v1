@@ -97,3 +97,28 @@ func TestDeviceKey(t *testing.T) {
 		t.Fatalf("ipv4 key = %q", got)
 	}
 }
+
+// TestReportModeTracksDevices guards #15: report mode must still count devices
+// so an operator can evaluate a limit before enforcing it.
+func TestReportModeTracksDevices(t *testing.T) {
+	g := NewGate(NodeConfig{LimitsMode: "report"}, []User{{ID: 1, DeviceLimit: 1}})
+	l1 := &transport.Link{}
+	l2 := &transport.Link{}
+	if !g.Before(gateCtx("u1", "1.1.1.1"), l1) || !g.Before(gateCtx("u1", "2.2.2.2"), l2) {
+		t.Fatal("report mode must not reject")
+	}
+	m := g.Metrics()
+	if m.Devices != 2 {
+		t.Fatalf("devices = %d, want 2", m.Devices)
+	}
+	if m.RejectsDevice != 0 {
+		t.Fatalf("device rejects = %d, want 0", m.RejectsDevice)
+	}
+	if _, devices := g.Stats(1); devices != 2 {
+		t.Fatalf("Stats devices = %d, want 2", devices)
+	}
+	g.After(gateCtx("u1", "1.1.1.1"), l1)
+	if _, devices := g.Stats(1); devices != 1 {
+		t.Fatalf("devices after release = %d, want 1", devices)
+	}
+}

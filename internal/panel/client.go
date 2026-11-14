@@ -270,6 +270,15 @@ func (c *Client) getJSON(ctx context.Context, path string, out any) (changed boo
 	return changed, nil
 }
 
+const (
+	// maxRetryDelay caps the exponential backoff between attempts.
+	maxRetryDelay = 5 * time.Minute
+	// maxRetryAfterWait caps how long a single 429 may stall the caller. The
+	// panel controls Retry-After, so an unbounded value would let one response
+	// block config apply (and applyMu) for an arbitrary amount of time.
+	maxRetryAfterWait = 60 * time.Second
+)
+
 func (c *Client) get(ctx context.Context, path string) ([]byte, bool, error) {
 	var cached store.ETagRecord
 	haveCache := false
@@ -289,17 +298,21 @@ func (c *Client) get(ctx context.Context, path string) ([]byte, bool, error) {
 	}
 	var lastErr error
 	for attempt := 1; attempt <= attempts; attempt++ {
-		body, changed, retry, err := c.getOnce(ctx, path, cached, haveCache)
+		body, changed, retry, wait, err := c.getOnce(ctx, path, cached, haveCache)
 		if err == nil {
 			return body, changed, nil
 		}
 		lastErr = err
 		if !retry || attempt == attempts {
+			// No further attempt: do not sleep, the caller gets the error now.
 			break
 		}
 		delay := c.cfg.RetryBase * time.Duration(1<<uint(attempt-1))
-		if delay > 5*time.Minute {
-			delay = 5 * time.Minute
+		if wait > delay {
+			delay = wait
+		}
+		if delay > maxRetryDelay {
+			delay = maxRetryDelay
 		}
 		if !sleep(ctx, delay) {
 			return nil, false, ctx.Err()
@@ -308,10 +321,13 @@ func (c *Client) get(ctx context.Context, path string) ([]byte, bool, error) {
 	return nil, false, lastErr
 }
 
-func (c *Client) getOnce(ctx context.Context, path string, cached store.ETagRecord, haveCache bool) (body []byte, changed, retry bool, err error) {
+// getOnce performs one request. wait is the server-requested delay (429
+// Retry-After); the caller decides whether another attempt is worth sleeping
+// for.
+func (c *Client) getOnce(ctx context.Context, path string, cached store.ETagRecord, haveCache bool) (body []byte, changed, retry bool, wait time.Duration, err error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.base+path, nil)
 	if err != nil {
-		return nil, false, false, err
+		return nil, false, false, 0, err
 	}
 	c.setHeaders(req)
 	req.Header.Set("Accept", "application/json")
@@ -320,7 +336,7 @@ func (c *Client) getOnce(ctx context.Context, path string, cached store.ETagReco
 	}
 	resp, err := c.http.Do(req)
 	if err != nil {
-		return nil, false, true, fmt.Errorf("panel %s: %w", path, err)
+		return nil, false, true, 0, fmt.Errorf("panel %s: %w", path, err)
 	}
 	defer resp.Body.Close()
 
@@ -328,21 +344,22 @@ func (c *Client) getOnce(ctx context.Context, path string, cached store.ETagReco
 	case resp.StatusCode == http.StatusNotModified:
 		if !haveCache || len(cached.Body) == 0 {
 			// Cache lost: retry unconditionally instead of returning a 304.
-			return c.getOnceUnconditional(ctx, path)
+			b, changed, retry, err := c.getOnceUnconditional(ctx, path)
+			return b, changed, retry, 0, err
 		}
 		if c.cache != nil {
 			cached.FetchedAt = time.Now()
 			_ = c.cache.PutETag(c.cacheKey(path), cached)
 		}
-		return cached.Body, false, false, nil
+		return cached.Body, false, false, 0, nil
 	case resp.StatusCode == http.StatusOK:
 		limited := io.LimitReader(resp.Body, c.cfg.MaxResponseSize+1)
 		b, err := io.ReadAll(limited)
 		if err != nil {
-			return nil, false, true, fmt.Errorf("panel %s: read body: %w", path, err)
+			return nil, false, true, 0, fmt.Errorf("panel %s: read body: %w", path, err)
 		}
 		if int64(len(b)) > c.cfg.MaxResponseSize {
-			return nil, false, false, fmt.Errorf("panel %s: response exceeds %d bytes", path, c.cfg.MaxResponseSize)
+			return nil, false, false, 0, fmt.Errorf("panel %s: response exceeds %d bytes", path, c.cfg.MaxResponseSize)
 		}
 		same := haveCache && len(cached.Body) > 0 && sha256.Sum256(b) == sha256.Sum256(cached.Body)
 		rec := store.ETagRecord{
@@ -351,21 +368,18 @@ func (c *Client) getOnce(ctx context.Context, path string, cached store.ETagReco
 			FetchedAt: time.Now(),
 		}
 		if c.cache != nil {
-			if err := c.cache.PutETag(c.cacheKey(path), rec); err != nil {
-				return nil, false, false, fmt.Errorf("panel %s: cache write: %w", path, err)
-			}
+			// A cache write failure must not discard a valid response: the
+			// read-only state DB (dump-config) and a full disk would otherwise
+			// turn into a panel outage.
+			_ = c.cache.PutETag(c.cacheKey(path), rec)
 		}
-		return b, !same, false, nil
+		return b, !same, false, 0, nil
 	case resp.StatusCode == http.StatusTooManyRequests:
-		delay := retryAfter(resp.Header.Get("Retry-After"))
-		if delay > 0 && !sleep(ctx, delay) {
-			return nil, false, false, ctx.Err()
-		}
-		return nil, false, true, &HTTPError{Path: path, Status: resp.StatusCode, Body: readSmall(resp.Body)}
+		return nil, false, true, clampRetryAfter(retryAfter(resp.Header.Get("Retry-After"))), &HTTPError{Path: path, Status: resp.StatusCode, Body: readSmall(resp.Body)}
 	case resp.StatusCode >= 500:
-		return nil, false, true, &HTTPError{Path: path, Status: resp.StatusCode, Body: readSmall(resp.Body)}
+		return nil, false, true, 0, &HTTPError{Path: path, Status: resp.StatusCode, Body: readSmall(resp.Body)}
 	default:
-		return nil, false, false, &HTTPError{Path: path, Status: resp.StatusCode, Body: readSmall(resp.Body)}
+		return nil, false, false, 0, &HTTPError{Path: path, Status: resp.StatusCode, Body: readSmall(resp.Body)}
 	}
 }
 
@@ -451,6 +465,15 @@ func (c *Client) setHeaders(req *http.Request) {
 func readSmall(r io.Reader) string {
 	b, _ := io.ReadAll(io.LimitReader(r, 4096))
 	return strings.TrimSpace(string(b))
+}
+
+// clampRetryAfter bounds a server-supplied Retry-After. The panel controls
+// this value, so an unbounded wait could block config apply indefinitely.
+func clampRetryAfter(d time.Duration) time.Duration {
+	if d > maxRetryAfterWait {
+		return maxRetryAfterWait
+	}
+	return d
 }
 
 func retryAfter(v string) time.Duration {

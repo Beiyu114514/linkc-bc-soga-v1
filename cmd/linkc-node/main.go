@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/signal"
 	"strings"
+	"sync"
 	"syscall"
 
 	"github.com/Beiyu114514/linkc-bc-soga-v1/internal/admin"
@@ -112,17 +113,28 @@ func runAgent(path string) error {
 	hup := make(chan os.Signal, 1)
 	signal.Notify(hup, syscall.SIGHUP)
 	defer signal.Stop(hup)
+	// The reload goroutine must be joined before the deferred a.Close() tears
+	// down the store and Xray, otherwise an in-flight ReloadCerts can race
+	// with shutdown and touch a closed DB or engine.
+	hupCtx, stopHup := context.WithCancel(ctx)
+	var hupWG sync.WaitGroup
+	hupWG.Add(1)
 	go func() {
+		defer hupWG.Done()
 		for {
 			select {
 			case <-hup:
 				if err := a.ReloadCerts(); err != nil {
 					log.Error("reload certificates", "error", err)
 				}
-			case <-ctx.Done():
+			case <-hupCtx.Done():
 				return
 			}
 		}
+	}()
+	defer func() {
+		stopHup()
+		hupWG.Wait()
 	}()
 	var adm *admin.Server
 	if cfg.Admin.Socket != "" {
@@ -243,7 +255,9 @@ func redact(v any) {
 	case map[string]any:
 		for k, val := range x {
 			switch strings.ToLower(k) {
-			case "id", "email", "privatekey", "private_key", "certificate", "key", "shortids", "short_ids", "headers":
+			case "id", "email", "privatekey", "private_key", "certificate", "key",
+				"shortids", "short_ids", "headers",
+				"echserverkeys", "ech_server_keys", "mldsa65seed", "mldsa65_seed":
 				x[k] = "***"
 			default:
 				redact(val)

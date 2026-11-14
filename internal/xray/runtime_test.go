@@ -97,6 +97,9 @@ func TestBuildConfigMatrix(t *testing.T) {
 	reality.PrivateKey = "private"
 	reality.ServerNames = []string{"example.com"}
 	reality.Dest = "example.com:443"
+	// An empty short_id is the documented way to disable shortIds; Xray
+	// accepts it (it hex-decodes to an all-zero id).
+	reality.ShortIDs = []string{""}
 	if _, err := xray.BuildConfig(reality, nil, "vless-1"); err != nil {
 		t.Fatal(err)
 	}

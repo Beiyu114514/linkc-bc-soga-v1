@@ -82,28 +82,42 @@ func (m *Manager) Collect() (int64, error) {
 
 // Push sends pending journal records. Success is acknowledged record by
 // record; a crash between POST and ack can duplicate a batch (at-least-once).
+// It drains the journal in rounds until it is empty or the time budget is
+// spent, so a burst of Collect records cannot outpace the push rate.
 func (m *Manager) Push(ctx context.Context, client *panel.Client, batchUsers int, batchBytes int64) (int64, error) {
-	m.mu.Lock()
-	mem := append([]store.TrafficDelta(nil), m.mem...)
-	m.mu.Unlock()
-	if len(mem) > 0 {
-		return 0, fmt.Errorf("traffic: %d deltas are not journaled yet", len(mem))
-	}
 	if batchUsers <= 0 {
 		batchUsers = 500
 	}
 	if batchBytes <= 0 {
 		batchBytes = 1 << 20
 	}
-	const maxRecords = 5000
-	records, err := m.store.PendingTraffic(maxRecords)
-	if err != nil {
-		return 0, err
+	const (
+		maxRecords = 5000
+		budget     = 5 * time.Second
+	)
+	var pushed int64
+	start := time.Now()
+	for {
+		records, err := m.store.PendingTraffic(maxRecords)
+		if err != nil {
+			return pushed, err
+		}
+		if len(records) == 0 {
+			return pushed, nil
+		}
+		n, err := m.pushRecords(ctx, client, records, batchUsers, batchBytes)
+		pushed += n
+		if err != nil {
+			return pushed, err
+		}
+		if time.Since(start) >= budget {
+			return pushed, nil
+		}
 	}
-	if len(records) == 0 {
-		return 0, nil
-	}
+}
 
+// pushRecords aggregates one journal page per user and posts it in batches.
+func (m *Manager) pushRecords(ctx context.Context, client *panel.Client, records []store.TrafficRecord, batchUsers int, batchBytes int64) (int64, error) {
 	type agg struct {
 		id   int64
 		u    int64
@@ -164,6 +178,30 @@ func (m *Manager) Push(ctx context.Context, client *panel.Client, batchUsers int
 		return pushed, err
 	}
 	return pushed, nil
+}
+
+// FlushMem retries journaling the in-memory backlog left behind by a failed
+// journal write. Counters are not read again until this succeeds, so it must
+// be attempted before the journal size guard pauses collection.
+func (m *Manager) FlushMem() error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if len(m.mem) == 0 {
+		return nil
+	}
+	if _, err := m.store.AppendTraffic(m.mem); err != nil {
+		m.lastErr = err
+		return fmt.Errorf("traffic: flush memory backlog: %w", err)
+	}
+	m.mem = nil
+	return nil
+}
+
+// JournalBytes reports the size of the durable journal only, excluding the
+// in-memory backlog that has not been journaled yet.
+func (m *Manager) JournalBytes() int64 {
+	n, _ := m.store.PendingBytes()
+	return n
 }
 
 // PendingBytes includes journaled and in-memory (failed journal) bytes.

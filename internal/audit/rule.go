@@ -151,7 +151,7 @@ func Compile(rawRules []panel.AuditRule, white []string, cfg Config) (*Rules, St
 			stats.Errors = append(stats.Errors, fmt.Sprintf("duplicate rule id %d", raw.ID))
 			continue
 		}
-		if len(raw.Rule) == 0 || len(raw.Rule) > 4096 {
+		if len(strings.TrimSpace(raw.Rule)) == 0 || len(raw.Rule) > 4096 {
 			stats.Skipped++
 			stats.Errors = append(stats.Errors, fmt.Sprintf("rule %d has invalid length", raw.ID))
 			continue
@@ -202,6 +202,11 @@ func Compile(rawRules []panel.AuditRule, white []string, cfg Config) (*Rules, St
 				continue
 			}
 			r.white = append(r.white, cs...)
+			for _, c := range cs {
+				if c.kind == kindIP {
+					r.hasIP = true
+				}
+			}
 			continue
 		}
 		c, err := parseOne(0, w, mode)
@@ -211,6 +216,11 @@ func Compile(rawRules []panel.AuditRule, white []string, cfg Config) (*Rules, St
 			continue
 		}
 		r.white = append(r.white, c)
+		if c.kind == kindIP {
+			// A whitelist-only IP rule still needs DNS resolution in Check,
+			// otherwise the matcher never receives an IP and cannot allow it.
+			r.hasIP = true
+		}
 	}
 	if cfg.Strict && stats.Skipped > 0 {
 		return nil, stats, fmt.Errorf("audit: %d rules failed to compile (strict mode)", stats.Skipped)
@@ -220,6 +230,11 @@ func Compile(rawRules []panel.AuditRule, white []string, cfg Config) (*Rules, St
 
 func parseOne(id int64, raw string, mode Mode) (compiled, error) {
 	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		// A whitespace-only rule would otherwise compile to keyword "" which
+		// matches every domain, blocking (or flooding) the whole node.
+		return compiled{}, fmt.Errorf("empty rule")
+	}
 	c := compiled{id: id, raw: raw}
 	prefix, value, hasPrefix := splitPrefix(raw)
 	if hasPrefix {
@@ -272,6 +287,10 @@ func splitPrefix(raw string) (string, string, bool) {
 }
 
 func parsePrefixed(c compiled, prefix, value string) (compiled, bool, error) {
+	if value == "" {
+		// "keyword:" / "regexp:" with an empty value would match everything.
+		return compiled{}, true, fmt.Errorf("empty value for prefix %q", prefix)
+	}
 	switch prefix {
 	case "geosite", "geoip":
 		return compiled{}, false, fmt.Errorf("geosite/geoip is not enabled in this build")
