@@ -131,6 +131,7 @@ func (s Spec) Xray(local LocalRuntime) (xray.NodeConfig, error) {
 		AllowPrivate:     local.AllowPrivate,
 		CertPEM:          local.CertPEM,
 		KeyPEM:           local.KeyPEM,
+		Certificates:     append([]xray.TLSCertificate(nil), local.Certificates...),
 		Sniffing:         local.Sniffing,
 		LimitsMode:       local.LimitsMode,
 		BurstBytes:       local.BurstBytes,

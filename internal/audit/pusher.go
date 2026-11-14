@@ -38,3 +38,15 @@ func (c *Checker) Push(ctx context.Context, client *panel.Client, batch int) (in
 	}
 	return len(items), nil
 }
+
+// Pending returns the number of queued audit events.
+func (c *Checker) Pending() int {
+	if c.st == nil {
+		return 0
+	}
+	n, err := c.st.PendingAuditCount()
+	if err != nil {
+		return 0
+	}
+	return n
+}

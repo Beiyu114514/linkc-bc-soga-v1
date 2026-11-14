@@ -43,6 +43,7 @@ type Snapshot struct {
 	AuditHits     uint64            `json:"audit_hits"`
 	AuditReported uint64            `json:"audit_reported"`
 	AuditBlocked  uint64            `json:"audit_blocked"`
+	AuditPending  int               `json:"audit_pending"`
 	LastError     string            `json:"last_error,omitempty"`
 	LastSuccess   map[string]string `json:"last_success"`
 	Version       string            `json:"version"`
@@ -364,6 +365,7 @@ func (a *Agent) Snapshot() Snapshot {
 		s.AuditHits = st.Hits
 		s.AuditReported = st.Reported
 		s.AuditBlocked = st.Blocked
+		s.AuditPending = checker.Pending()
 	}
 	return s
 }
@@ -395,6 +397,19 @@ func (a *Agent) localRuntimeWith(certs []xray.TLSCertificate) node.LocalRuntime 
 func LastGoodKey(nodeID, kind string) string { return nodeID + "|" + kind }
 
 func (a *Agent) lastGood(kind string) string { return LastGoodKey(a.cfg.Panel.NodeID, kind) }
+
+// commitNode makes the agent state match a successfully applied inbound.
+func (a *Agent) commitNode(spec node.Spec, xc xray.NodeConfig, users []xray.User) {
+	a.mu.Lock()
+	a.nodeSpec, a.xrayCfg = spec, xc
+	a.inboundFP = node.InboundFingerprint(xc)
+	a.users, a.usersFP = users, node.UsersFingerprint(users)
+	a.hasNode, a.hasUsers = true, true
+	a.updateIntervalsLocked(spec)
+	a.mu.Unlock()
+	a.saveNode(spec)
+	a.saveUsers(users)
+}
 
 // ReloadCerts re-reads certificate files and hot-swaps the inbound when the
 // inline material changed. SIGHUP calls this.
@@ -429,14 +444,25 @@ func (a *Agent) ReloadCerts() error {
 		return nil
 	}
 	a.collect(context.Background())
-	tag := fmt.Sprintf("vless-%d", time.Now().UnixNano())
-	oldTag := engine.Tag()
-	if err := engine.AddInbound(context.Background(), xc, users, tag); err != nil {
-		a.collect(context.Background())
-		return fmt.Errorf("reload certs: add inbound: %w", err)
-	}
-	if err := a.removeInbound(context.Background(), engine, oldTag); err != nil {
-		a.log.Error("reload certs: remove old inbound; queued for retry", "tag", oldTag, "error", err)
+	rep, err := engine.SwapInbound(context.Background(), xc, users)
+	if err != nil {
+		if rep.StaleTag != "" {
+			a.log.Error("reload certs: old inbound still bound; queued for retry", "tag", rep.StaleTag, "error", err)
+			a.queueRemove(rep.StaleTag)
+		}
+		if !rep.Applied {
+			if rep.Tag == "" {
+				// No listener: force the next pull to re-apply the node config.
+				a.mu.Lock()
+				a.inboundFP = ""
+				a.mu.Unlock()
+			}
+			a.collect(context.Background())
+			return fmt.Errorf("reload certs: %w", err)
+		}
+		// The new inbound is live (possibly with a stale old listener); keep
+		// the new certificate material and surface the warning below.
+		a.log.Warn("certificates reloaded with warning", "warning", rep.Warning, "error", err)
 	}
 	a.certs = certs
 	a.mu.Lock()
@@ -444,6 +470,12 @@ func (a *Agent) ReloadCerts() error {
 	a.inboundFP = newFP
 	a.mu.Unlock()
 	a.collect(context.Background())
+	if err != nil {
+		return err
+	}
+	if rep.Warning != "" {
+		a.log.Warn("certificates reloaded with warning", "warning", rep.Warning)
+	}
 	a.log.Info("certificates reloaded", "certificates", len(certs))
 	return nil
 }
@@ -466,6 +498,17 @@ func isNotFound(err error) bool {
 	return err == nil || strings.Contains(strings.ToLower(err.Error()), "not found")
 }
 
+// queueRemove remembers an inbound tag whose removal failed so a later pull
+// can retry it instead of leaving a listener with stale users/certs behind.
+func (a *Agent) queueRemove(tag string) {
+	if tag == "" {
+		return
+	}
+	a.mu.Lock()
+	a.pendingRemove = append(a.pendingRemove, tag)
+	a.mu.Unlock()
+}
+
 // removeInbound removes an inbound, retrying transient failures. If removal
 // keeps failing the tag is queued so the stale listener is cleaned up later
 // instead of silently serving old users/certs.
@@ -481,9 +524,7 @@ func (a *Agent) removeInbound(ctx context.Context, engine *xray.Engine, tag stri
 			}
 		}
 	}
-	a.mu.Lock()
-	a.pendingRemove = append(a.pendingRemove, tag)
-	a.mu.Unlock()
+	a.queueRemove(tag)
 	return err
 }
 
@@ -495,6 +536,9 @@ func (a *Agent) flushPendingRemove(ctx context.Context, engine *xray.Engine) {
 	a.mu.Unlock()
 	var keep []string
 	for _, tag := range pending {
+		if tag == "" {
+			continue
+		}
 		if err := engine.RemoveInbound(ctx, tag); !isNotFound(err) {
 			keep = append(keep, tag)
 		}
