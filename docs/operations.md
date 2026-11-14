@@ -106,19 +106,22 @@ curl --unix-socket /run/linkc-node/admin.sock http://localhost/status
 curl --unix-socket /run/linkc-node/admin.sock http://localhost/metrics
 ```
 
-指标包括 `linkc_ready`、`linkc_degraded`、`linkc_users`、`linkc_online_ips`、`linkc_traffic_pending_bytes`。
+指标包括 `linkc_ready`、`linkc_degraded`、`linkc_users`、`linkc_online_ips`、
+`linkc_traffic_pending_bytes`、`linkc_audit_pending`、限额与审计计数器；
+完整清单、抓取方案与告警规则见 [monitoring.md](./monitoring.md) 与 `deploy/alerts.yml`。
 
-## M2 已具备
+## M3 已具备
 
 - `audit_rules` / `white_list` 拉取、编译、report/block、按 `(user, rule)` 去重入队、`/audit_log` 推送。
 - `alive_ip` 变更检测与推送；`full` / `changed` 模式。
 - `traffic.include_online_zero` 可补齐站点在线数。
-- 审计指标：`linkc_audit_rules`、`linkc_audit_hits_total`、`linkc_audit_reported_total`、`linkc_audit_blocked_total`。
+- 节点/用户限速、设备数（IPv6 /64 聚合）、TCP 连接数限制；`enforce` / `report` / `off`。
+- 审计指标：`linkc_audit_rules`、`linkc_audit_hits_total`、`linkc_audit_reported_total`、`linkc_audit_blocked_total`、`linkc_audit_pending`。
 
 ## 仍限制
 
-- `geosite:` / `geoip:` 规则尚未接入（跳过并告警）。
-- ECH、decryption、XHTTP/GRPC 完整参数尚未实现。
-- 多证书（按 SNI）暂不支持，MVP 一张证书。
+- ECH 实际握手未验证（站点不下发 ECH key，缺合法测试 key set）。
+- 多证书按 SNI 选择已支持；真实 CA 多域名场景待上线验证。
 - 审计依赖 sniffing；纯 IP、ECH/ESNI、HTTP/3 可能看不到域名。
 - `dump-config` 仅用于排查，不要直接作为生产配置启动。
+- 24h 长稳与目标机 systemd/SELinux 兼容性待验收（见 `docs/security-audit.md`）。

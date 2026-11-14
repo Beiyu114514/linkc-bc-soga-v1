@@ -1,12 +1,14 @@
 VERSION ?= dev
 COMMIT ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo unknown)
 DATE ?= $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
+SOAK_DURATION ?= 90s
+SOAK_TIMEOUT ?= 2m
 LDFLAGS := -s -w \
   -X github.com/Beiyu114514/linkc-bc-soga-v1/internal/version.Version=$(VERSION) \
   -X github.com/Beiyu114514/linkc-bc-soga-v1/internal/version.Commit=$(COMMIT) \
   -X github.com/Beiyu114514/linkc-bc-soga-v1/internal/version.Date=$(DATE)
 
-.PHONY: all build linux-amd64 linux-arm64 test race vet fmt clean package-deb package-rpm
+.PHONY: all build linux-amd64 linux-arm64 test race vet fmt clean package-deb package-rpm soak bench
 
 all: build
 
@@ -41,3 +43,11 @@ package-deb:
 package-rpm:
 	mkdir -p dist
 	VERSION=$(VERSION) nfpm package -f packaging/nfpm.yaml -p rpm -t dist/
+
+# Randomized fault-injection soak (panel 5xx/429, outages, port swaps, user
+# churn, certificate rotation). Use e.g. SOAK_DURATION=24h SOAK_TIMEOUT=25h.
+soak:
+	SOAK_DURATION=$(SOAK_DURATION) go test ./internal/agent -run TestSoak -count=1 -timeout $(SOAK_TIMEOUT)
+
+bench:
+	go test ./internal/xray -run '^$$' -bench . -benchtime 20x

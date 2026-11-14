@@ -324,6 +324,16 @@ func (s *Store) PendingCount() (int, error) {
 	return n, err
 }
 
+// PendingAuditCount returns the number of queued audit events.
+func (s *Store) PendingAuditCount() (int, error) {
+	n := 0
+	err := s.db.View(func(tx *bolt.Tx) error {
+		n = tx.Bucket(bucketAudit).Stats().KeyN
+		return nil
+	})
+	return n, err
+}
+
 // AppendAudit durably enqueues audit events.
 func (s *Store) AppendAudit(events []AuditRecord) ([]uint64, error) {
 	if len(events) == 0 {

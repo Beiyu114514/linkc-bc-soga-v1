@@ -43,6 +43,7 @@ type Snapshot struct {
 	AuditHits     uint64            `json:"audit_hits"`
 	AuditReported uint64            `json:"audit_reported"`
 	AuditBlocked  uint64            `json:"audit_blocked"`
+	AuditPending  int               `json:"audit_pending"`
 	LastError     string            `json:"last_error,omitempty"`
 	LastSuccess   map[string]string `json:"last_success"`
 	Version       string            `json:"version"`
@@ -360,6 +361,7 @@ func (a *Agent) Snapshot() Snapshot {
 		s.AuditHits = st.Hits
 		s.AuditReported = st.Reported
 		s.AuditBlocked = st.Blocked
+		s.AuditPending = checker.Pending()
 	}
 	return s
 }
@@ -400,6 +402,19 @@ func (a *Agent) localRuntimeWith(certs []xray.TLSCertificate) node.LocalRuntime 
 	}
 }
 
+// commitNode makes the agent state match a successfully applied inbound.
+func (a *Agent) commitNode(spec node.Spec, xc xray.NodeConfig, users []xray.User) {
+	a.mu.Lock()
+	a.nodeSpec, a.xrayCfg = spec, xc
+	a.inboundFP = node.InboundFingerprint(xc)
+	a.users, a.usersFP = users, node.UsersFingerprint(users)
+	a.hasNode, a.hasUsers = true, true
+	a.updateIntervalsLocked(spec)
+	a.mu.Unlock()
+	a.saveNode(spec)
+	a.saveUsers(users)
+}
+
 // ReloadCerts re-reads certificate files and hot-swaps the inbound when the
 // inline material changed. SIGHUP calls this.
 func (a *Agent) ReloadCerts() error {
@@ -432,14 +447,20 @@ func (a *Agent) ReloadCerts() error {
 		return nil
 	}
 	a.collect(context.Background())
-	tag := fmt.Sprintf("vless-%d", time.Now().UnixNano())
-	oldTag := engine.Tag()
-	if err := engine.AddInbound(context.Background(), xc, users, tag); err != nil {
-		a.collect(context.Background())
-		return fmt.Errorf("reload certs: add inbound: %w", err)
-	}
-	if err := engine.RemoveInbound(context.Background(), oldTag); err != nil {
-		a.log.Warn("reload certs: remove old inbound", "tag", oldTag, "error", err)
+	rep, err := engine.SwapInbound(context.Background(), xc, users)
+	if err != nil {
+		if rep.RolledBack {
+			// The previous inbound (with the previous certificates) is back
+			// in charge; keep the old material and surface the error.
+			a.collect(context.Background())
+			return fmt.Errorf("reload certs: %w", err)
+		}
+		if rep.Tag == "" {
+			// No listener: force the next pull to re-apply the node config.
+			a.mu.Lock()
+			a.inboundFP = ""
+			a.mu.Unlock()
+		}
 	}
 	a.certs = certs
 	a.mu.Lock()
@@ -447,6 +468,10 @@ func (a *Agent) ReloadCerts() error {
 	a.inboundFP = newFP
 	a.mu.Unlock()
 	a.collect(context.Background())
+	if err != nil {
+		a.log.Warn("certificates reloaded with warning", "warning", rep.Warning, "error", err)
+		return err
+	}
 	a.log.Info("certificates reloaded", "certificates", len(certs))
 	return nil
 }

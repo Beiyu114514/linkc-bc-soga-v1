@@ -47,3 +47,15 @@ func (c *Checker) HasPending() bool {
 	events, err := c.st.PendingAudit(1)
 	return err == nil && len(events) > 0
 }
+
+// Pending returns the number of queued audit events.
+func (c *Checker) Pending() int {
+	if c.st == nil {
+		return 0
+	}
+	n, err := c.st.PendingAuditCount()
+	if err != nil {
+		return 0
+	}
+	return n
+}

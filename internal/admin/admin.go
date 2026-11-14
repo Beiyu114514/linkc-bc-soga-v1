@@ -69,6 +69,7 @@ func Start(path string, snapshot func() agent.Snapshot) (*Server, error) {
 		fmt.Fprintf(w, "# TYPE linkc_audit_hits_total counter\nlinkc_audit_hits_total %d\n", s.AuditHits)
 		fmt.Fprintf(w, "# TYPE linkc_audit_reported_total counter\nlinkc_audit_reported_total %d\n", s.AuditReported)
 		fmt.Fprintf(w, "# TYPE linkc_audit_blocked_total counter\nlinkc_audit_blocked_total %d\n", s.AuditBlocked)
+		fmt.Fprintf(w, "# TYPE linkc_audit_pending gauge\nlinkc_audit_pending %d\n", s.AuditPending)
 	})
 	srv := &http.Server{Handler: mux, ReadHeaderTimeout: 5 * time.Second}
 	s := &Server{path: path, ln: ln, srv: srv}

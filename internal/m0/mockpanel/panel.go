@@ -149,6 +149,9 @@ type Panel struct {
 
 	// requests counts endpoint calls; useful in tests.
 	requests map[string]int
+
+	// faults are injected failures consumed by ServeHTTP.
+	faults []fault
 }
 
 func New(cfg Config) *Panel {
@@ -181,6 +184,11 @@ func New(cfg Config) *Panel {
 func (p *Panel) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	p.mu.Lock()
 	p.requests[r.Method+" "+r.URL.Path]++
+	if status, ok := p.takeFault(r.URL.Path); ok {
+		p.mu.Unlock()
+		p.error(w, status, "injected fault")
+		return
+	}
 	p.mu.Unlock()
 
 	switch r.URL.Path {
@@ -294,6 +302,48 @@ func (p *Panel) SetWebAPIDisabled(v bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.cfg.WebAPIDisabled = v
+}
+
+// SetFault makes requests to path return status instead of the real handler.
+// An empty path matches every request. times <= 0 lasts until ClearFaults.
+// It simulates panel-side failures (500/502/503/429) for chaos tests.
+func (p *Panel) SetFault(path string, status, times int) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.faults = append(p.faults, fault{path: path, status: status, times: times})
+}
+
+// ClearFaults removes all injected faults.
+func (p *Panel) ClearFaults() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.faults = nil
+}
+
+// fault is one pending injected failure.
+type fault struct {
+	path   string
+	status int
+	times  int
+}
+
+// takeFault consumes one fault matching path; it returns the status to send
+// and whether a fault was taken.
+func (p *Panel) takeFault(path string) (int, bool) {
+	for i := range p.faults {
+		f := &p.faults[i]
+		if f.path != "" && f.path != path {
+			continue
+		}
+		if f.times > 0 {
+			f.times--
+			if f.times == 0 {
+				p.faults = append(p.faults[:i], p.faults[i+1:]...)
+			}
+		}
+		return f.status, true
+	}
+	return 0, false
 }
 
 // Snapshot returns a deep-enough copy for assertions.

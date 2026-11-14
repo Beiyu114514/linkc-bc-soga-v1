@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"time"
 
 	"github.com/Beiyu114514/linkc-bc-soga-v1/internal/node"
 	"github.com/Beiyu114514/linkc-bc-soga-v1/internal/panel"
@@ -121,30 +120,39 @@ func (a *Agent) Sync(ctx context.Context) error {
 
 	if nodeCfgChanged {
 		a.collect(ctx)
-		tag := fmt.Sprintf("vless-%d", time.Now().UnixNano())
-		oldTag := engine.Tag()
-		if err := engine.AddInbound(ctx, xc, nextUsers, tag); err != nil {
-			applyErr = errors.Join(applyErr, fmt.Errorf("add inbound: %w", err))
-			a.setApplyError(err)
-			nodeUpdated = false // keep the current spec; retry next pull
-		} else {
-			if err := engine.RemoveInbound(ctx, oldTag); err != nil {
-				// The new listener is live; a stale listener is noisy but not fatal.
-				a.log.Warn("remove old inbound", "tag", oldTag, "error", err)
-			}
+		rep, err := engine.SwapInbound(ctx, xc, nextUsers)
+		switch {
+		case err == nil:
 			engine.SetNodeSpeed(spec.Basic.SpeedLimit)
-			a.mu.Lock()
-			a.nodeSpec, a.xrayCfg = spec, xc
-			a.inboundFP = node.InboundFingerprint(xc)
-			a.users, a.usersFP = nextUsers, node.UsersFingerprint(nextUsers)
-			a.hasNode, a.hasUsers = true, true
-			a.updateIntervalsLocked(spec)
-			a.mu.Unlock()
-			a.saveNode(spec)
-			a.saveUsers(nextUsers)
+			a.commitNode(spec, xc, nextUsers)
 			usersApplied = true
 			nodeUpdated = false
-			a.log.Info("inbound applied", "port", spec.Config.Port, "tag", tag)
+			a.log.Info("inbound applied", "port", spec.Config.Port, "tag", rep.Tag)
+		case rep.RolledBack:
+			// The engine restored the previous inbound; keep agent state
+			// unchanged and retry on the next pull.
+			applyErr = errors.Join(applyErr, fmt.Errorf("swap inbound: %w", err))
+			a.setApplyError(err)
+			nodeUpdated = false
+			a.log.Warn("inbound swap rolled back", "error", err)
+		case rep.Tag != "":
+			// The new inbound is live, possibly with a stale old listener.
+			engine.SetNodeSpeed(spec.Basic.SpeedLimit)
+			a.commitNode(spec, xc, nextUsers)
+			usersApplied = true
+			nodeUpdated = false
+			applyErr = errors.Join(applyErr, fmt.Errorf("swap inbound: %w", err))
+			a.setApplyError(err)
+			a.log.Warn("inbound swapped with warning", "warning", rep.Warning, "error", err)
+		default:
+			// No listener is registered; force a re-apply next pull.
+			applyErr = errors.Join(applyErr, fmt.Errorf("swap inbound: %w", err))
+			a.setApplyError(err)
+			nodeUpdated = false
+			a.mu.Lock()
+			a.inboundFP = ""
+			a.mu.Unlock()
+			a.log.Error("inbound swap failed; no listener registered", "error", err)
 		}
 		a.collect(ctx)
 	}

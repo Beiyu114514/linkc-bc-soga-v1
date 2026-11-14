@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/xtls/xray-core/common"
 	"github.com/xtls/xray-core/common/buf"
@@ -116,6 +117,7 @@ type Engine struct {
 	mu         sync.Mutex
 	inst       *core.Instance
 	tag        string
+	nodeCfg    NodeConfig
 	flow       string
 	port       int
 	users      map[int64]User
@@ -176,6 +178,7 @@ func Start(ctx context.Context, node NodeConfig, users []User) (*Engine, error) 
 	e := &Engine{
 		inst:       inst,
 		tag:        tag,
+		nodeCfg:    node,
 		flow:       node.Flow,
 		port:       node.Port,
 		users:      make(map[int64]User, len(users)),
@@ -261,10 +264,116 @@ func (e *Engine) ApplyUsers(ctx context.Context, users []User) error {
 	return nil
 }
 
+// SwapReport describes the outcome of an inbound swap.
+type SwapReport struct {
+	// Tag is the inbound tag now serving traffic ("" only if the engine
+	// ended up with no listener at all).
+	Tag string
+	// RolledBack is true when the previous inbound was restored because the
+	// old listener could not be removed.
+	RolledBack bool
+	// Warning carries a non-fatal anomaly, e.g. a stale old listener that is
+	// still bound to the port.
+	Warning string
+}
+
+// addInbound is indirected so tests can force add failures. Xray resolves the
+// inbound manager from the instance itself (core.AddInboundHandler), so
+// wrapping Engine.inboundMgr cannot intercept adds.
+var addInbound = func(e *Engine, ctx context.Context, node NodeConfig, users []User, tag string) error {
+	return e.addInboundHandler(ctx, node, users, tag)
+}
+
+// SwapInbound replaces the live inbound as a transaction:
+//
+//  1. add the new inbound (same-port overlap relies on SO_REUSEPORT);
+//  2. on add failure the previous inbound keeps serving and the error is
+//     returned with Tag set to the still-active tag;
+//  3. on remove failure of the old listener, roll back to the previous
+//     config: remove the new inbound and re-add the old one;
+//  4. if the rollback itself fails, the new inbound (which is live and
+//     serving) is kept and the error explains the stale state.
+//
+// After SwapInbound returns, the engine state (tag, users, gate limits)
+// always matches the inbound that is actually serving.
+func (e *Engine) SwapInbound(ctx context.Context, node NodeConfig, users []User) (SwapReport, error) {
+	if node.Listen == "" {
+		node.Listen = "127.0.0.1"
+	}
+	if err := ValidateConfig(node); err != nil {
+		return SwapReport{}, err
+	}
+	if err := ValidateUsers(users); err != nil {
+		return SwapReport{}, err
+	}
+	e.mu.Lock()
+	oldTag, oldCfg := e.tag, e.nodeCfg
+	oldUsers := e.userListLocked()
+	e.mu.Unlock()
+
+	tag := fmt.Sprintf("vless-%d", time.Now().UnixNano())
+	if err := addInbound(e, ctx, node, users, tag); err != nil {
+		// Nothing changed: the previous inbound keeps serving.
+		return SwapReport{Tag: oldTag}, fmt.Errorf("add inbound: %w", err)
+	}
+	if oldTag == "" {
+		// No previous inbound to remove (e.g. recovering from a failed
+		// rollback that left the engine without a handler).
+		e.commit(node, users, tag)
+		return SwapReport{Tag: tag}, nil
+	}
+	rmErr := e.inboundMgr.RemoveHandler(ctx, oldTag)
+	if rmErr == nil {
+		e.commit(node, users, tag)
+		return SwapReport{Tag: tag}, nil
+	}
+
+	// Removing the old listener failed. Roll back to the previous config so
+	// a stale inbound cannot keep serving an outdated user set.
+	if err := e.inboundMgr.RemoveHandler(ctx, tag); err != nil {
+		// The new inbound is live but cannot be removed. Keep serving with
+		// it; the stale old listener is reported as a warning.
+		e.commit(node, users, tag)
+		return SwapReport{Tag: tag, Warning: fmt.Sprintf("old inbound %s still bound: %v", oldTag, rmErr)},
+			fmt.Errorf("swap inbound: remove old %s: %w", oldTag, rmErr)
+	}
+	// A failed remove usually leaves the old handler registered (Xray only
+	// logs close errors), so it is already serving again after the new
+	// inbound was dropped; only re-add when it is really gone.
+	if _, err := e.inboundMgr.GetHandler(ctx, oldTag); err != nil {
+		if err := addInbound(e, ctx, oldCfg, oldUsers, oldTag); err != nil {
+			// Worst case: no inbound is registered. Try to bring the new
+			// config back so the node keeps serving traffic.
+			err2 := addInbound(e, ctx, node, users, tag)
+			if err2 == nil {
+				e.commit(node, users, tag)
+				return SwapReport{Tag: tag, Warning: "rollback failed; new inbound restored"},
+					fmt.Errorf("swap inbound: remove old %s: %w", oldTag, rmErr)
+			}
+			e.mu.Lock()
+			e.tag = ""
+			e.mu.Unlock()
+			return SwapReport{}, fmt.Errorf("swap inbound: remove old %s: %w; rollback to old failed: %v; restore new failed: %v",
+				oldTag, rmErr, err, err2)
+		}
+	}
+	e.commit(oldCfg, oldUsers, oldTag)
+	return SwapReport{Tag: oldTag, RolledBack: true},
+		fmt.Errorf("swap inbound: remove old %s: %w; rolled back to previous inbound", oldTag, rmErr)
+}
+
 // AddInbound adds a new VLESS inbound (same or different port), then returns
 // so the caller can remove the old tag. Same-port overlap relies on Xray's
-// SO_REUSEPORT listener.
+// SO_REUSEPORT listener. Prefer SwapInbound, which is transactional.
 func (e *Engine) AddInbound(ctx context.Context, node NodeConfig, users []User, tag string) error {
+	if err := e.addInboundHandler(ctx, node, users, tag); err != nil {
+		return err
+	}
+	e.commit(node, users, tag)
+	return nil
+}
+
+func (e *Engine) addInboundHandler(ctx context.Context, node NodeConfig, users []User, tag string) error {
 	if node.Listen == "" {
 		node.Listen = "127.0.0.1"
 	}
@@ -288,17 +397,30 @@ func (e *Engine) AddInbound(ctx context.Context, node NodeConfig, users []User, 
 	if err := core.AddInboundHandler(e.inst, cfg.Inbound[0]); err != nil {
 		return fmt.Errorf("add inbound %s: %w", tag, err)
 	}
+	return nil
+}
+
+// commit makes the engine state match the inbound that is now serving.
+func (e *Engine) commit(node NodeConfig, users []User, tag string) {
 	e.mu.Lock()
+	defer e.mu.Unlock()
 	e.tag = tag
 	e.flow = node.Flow
 	e.port = node.Port
+	e.nodeCfg = node
 	e.users = make(map[int64]User, len(users))
 	for _, u := range users {
 		e.users[u.ID] = u
 	}
 	e.gate.UpdateLimitsMap(users)
-	e.mu.Unlock()
-	return nil
+}
+
+func (e *Engine) userListLocked() []User {
+	out := make([]User, 0, len(e.users))
+	for _, u := range e.users {
+		out = append(out, u)
+	}
+	return out
 }
 
 // RemoveInbound removes an inbound by tag. Existing connections are left to
