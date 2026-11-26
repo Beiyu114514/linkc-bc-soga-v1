@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -189,5 +190,63 @@ func Test429DoesNotSleepOnLastAttempt(t *testing.T) {
 	}
 	if elapsed := time.Since(start); elapsed > time.Second {
 		t.Fatalf("last attempt slept for %v", elapsed)
+	}
+}
+
+func TestPostJSONRequiresCodeAndHandlesLarge200(t *testing.T) {
+	var bodyToSend atomic.Value
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(bodyToSend.Load().(string)))
+	}))
+	defer srv.Close()
+
+	c, err := New(Options{BaseURL: srv.URL, APIKey: "k", NodeID: "1", AllowHTTP: true, MaxAttempts: 1}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Missing "code" field on 200 JSON must fail.
+	bodyToSend.Store(`{"ok":true}`)
+	if err := c.PushTraffic(context.Background(), []Traffic{{ID: 1, U: 10, D: 20}}); err == nil {
+		t.Fatal("expected error when 200 JSON lacks code field")
+	}
+
+	// Non-zero code must fail.
+	bodyToSend.Store(`{"code":1,"msg":"bad"}`)
+	if err := c.PushTraffic(context.Background(), []Traffic{{ID: 1, U: 10, D: 20}}); err == nil {
+		t.Fatal("expected error when 200 JSON has non-zero code")
+	}
+
+	// Large (>4 KiB) 200 JSON with code=0 at the end must NOT be truncated.
+	largeOK := `{"pad":"` + strings.Repeat("a", 8192) + `","code":0}`
+	bodyToSend.Store(largeOK)
+	if err := c.PushTraffic(context.Background(), []Traffic{{ID: 1, U: 10, D: 20}}); err != nil {
+		t.Fatalf("large 200 JSON with code=0 failed: %v", err)
+	}
+}
+
+func TestGetRejectsMalformed200JSONBeforeETagCache(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("ETag", `"bad-etag"`)
+		_, _ = w.Write([]byte(`{not-json`))
+	}))
+	defer srv.Close()
+
+	st, err := store.Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	c, err := New(Options{BaseURL: srv.URL, APIKey: "k", NodeID: "1", AllowHTTP: true, MaxAttempts: 1}, st)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := c.FetchNode(context.Background()); err == nil {
+		t.Fatal("expected error for malformed JSON body")
+	}
+	if _, ok, err := st.GetETag("/api/v1/node_info?node_id=1"); err != nil || ok {
+		t.Fatalf("malformed 200 response must not be cached: ok=%v err=%v", ok, err)
 	}
 }

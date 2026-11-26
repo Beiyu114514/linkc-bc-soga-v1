@@ -284,10 +284,7 @@ func (c *Client) get(ctx context.Context, path string) ([]byte, bool, error) {
 	haveCache := false
 	if c.cache != nil {
 		rec, ok, err := c.cache.GetETag(c.cacheKey(path))
-		if err != nil {
-			return nil, false, err
-		}
-		if ok {
+		if err == nil && ok {
 			cached, haveCache = rec, true
 		}
 	}
@@ -344,8 +341,8 @@ func (c *Client) getOnce(ctx context.Context, path string, cached store.ETagReco
 	case resp.StatusCode == http.StatusNotModified:
 		if !haveCache || len(cached.Body) == 0 {
 			// Cache lost: retry unconditionally instead of returning a 304.
-			b, changed, retry, err := c.getOnceUnconditional(ctx, path)
-			return b, changed, retry, 0, err
+			b, changed, retry, wait, err := c.getOnceUnconditional(ctx, path)
+			return b, changed, retry, wait, err
 		}
 		if c.cache != nil {
 			cached.FetchedAt = time.Now()
@@ -360,6 +357,9 @@ func (c *Client) getOnce(ctx context.Context, path string, cached store.ETagReco
 		}
 		if int64(len(b)) > c.cfg.MaxResponseSize {
 			return nil, false, false, 0, fmt.Errorf("panel %s: response exceeds %d bytes", path, c.cfg.MaxResponseSize)
+		}
+		if !json.Valid(b) {
+			return nil, false, false, 0, fmt.Errorf("panel %s: invalid json response", path)
 		}
 		same := haveCache && len(cached.Body) > 0 && sha256.Sum256(b) == sha256.Sum256(cached.Body)
 		rec := store.ETagRecord{
@@ -384,32 +384,42 @@ func (c *Client) getOnce(ctx context.Context, path string, cached store.ETagReco
 }
 
 // getOnceUnconditional handles a 304 whose cached body is missing.
-func (c *Client) getOnceUnconditional(ctx context.Context, path string) ([]byte, bool, bool, error) {
+func (c *Client) getOnceUnconditional(ctx context.Context, path string) ([]byte, bool, bool, time.Duration, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.base+path, nil)
 	if err != nil {
-		return nil, false, false, err
+		return nil, false, false, 0, err
 	}
 	c.setHeaders(req)
+	req.Header.Set("Accept", "application/json")
 	resp, err := c.http.Do(req)
 	if err != nil {
-		return nil, false, true, err
+		return nil, false, true, 0, err
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return nil, false, false, &HTTPError{Path: path, Status: resp.StatusCode, Body: readSmall(resp.Body)}
+	switch {
+	case resp.StatusCode == http.StatusOK:
+	case resp.StatusCode == http.StatusTooManyRequests:
+		return nil, false, true, clampRetryAfter(retryAfter(resp.Header.Get("Retry-After"))), &HTTPError{Path: path, Status: resp.StatusCode, Body: readSmall(resp.Body)}
+	case resp.StatusCode >= 500:
+		return nil, false, true, 0, &HTTPError{Path: path, Status: resp.StatusCode, Body: readSmall(resp.Body)}
+	default:
+		return nil, false, false, 0, &HTTPError{Path: path, Status: resp.StatusCode, Body: readSmall(resp.Body)}
 	}
 	b, err := io.ReadAll(io.LimitReader(resp.Body, c.cfg.MaxResponseSize+1))
 	if err != nil {
-		return nil, false, true, err
+		return nil, false, true, 0, err
 	}
 	if int64(len(b)) > c.cfg.MaxResponseSize {
-		return nil, false, false, fmt.Errorf("panel %s: response too large", path)
+		return nil, false, false, 0, fmt.Errorf("panel %s: response exceeds %d bytes", path, c.cfg.MaxResponseSize)
+	}
+	if !json.Valid(b) {
+		return nil, false, false, 0, fmt.Errorf("panel %s: invalid json response", path)
 	}
 	rec := store.ETagRecord{ETag: resp.Header.Get("ETag"), Body: b, FetchedAt: time.Now()}
 	if c.cache != nil {
 		_ = c.cache.PutETag(c.cacheKey(path), rec)
 	}
-	return b, true, false, nil
+	return b, true, false, 0, nil
 }
 
 func (c *Client) postJSON(ctx context.Context, path string, payload any) error {
@@ -429,19 +439,28 @@ func (c *Client) postJSON(ctx context.Context, path string, payload any) error {
 		return fmt.Errorf("panel %s: %w", path, err)
 	}
 	defer resp.Body.Close()
-	body := readSmall(resp.Body)
 	if resp.StatusCode != http.StatusOK {
-		return &HTTPError{Path: path, Status: resp.StatusCode, Body: body}
+		return &HTTPError{Path: path, Status: resp.StatusCode, Body: readSmall(resp.Body)}
+	}
+	respBody, err := io.ReadAll(io.LimitReader(resp.Body, c.cfg.MaxResponseSize+1))
+	if err != nil {
+		return fmt.Errorf("panel %s: read body: %w", path, err)
+	}
+	if int64(len(respBody)) > c.cfg.MaxResponseSize {
+		return fmt.Errorf("panel %s: response exceeds %d bytes", path, c.cfg.MaxResponseSize)
 	}
 	var result struct {
-		Code    int    `json:"code"`
+		Code    *int   `json:"code"`
 		Message string `json:"message"`
 	}
-	if err := json.Unmarshal([]byte(body), &result); err != nil {
+	if err := json.Unmarshal(respBody, &result); err != nil {
 		return fmt.Errorf("panel %s: invalid response: %w", path, err)
 	}
-	if result.Code != 0 {
-		return fmt.Errorf("panel %s: code %d: %s", path, result.Code, result.Message)
+	if result.Code == nil {
+		return fmt.Errorf("panel %s: response missing code", path)
+	}
+	if *result.Code != 0 {
+		return fmt.Errorf("panel %s: code %d: %s", path, *result.Code, result.Message)
 	}
 	return nil
 }

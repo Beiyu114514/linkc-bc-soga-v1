@@ -7,6 +7,7 @@ import (
 	"sync"
 
 	"github.com/Beiyu114514/linkc-bc-soga-v1/internal/panel"
+	"github.com/Beiyu114514/linkc-bc-soga-v1/internal/xray"
 )
 
 // aliveTracker sends online IP changes to the panel. The target site only
@@ -36,8 +37,7 @@ func newAliveTracker(fullEach int, mode string) *aliveTracker {
 func (t *aliveTracker) pending(current map[int64][]string) (batch []panel.AliveIP, full bool) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	t.pushes++
-	full = t.mode == "full" || t.pushes%t.fullEach == 0
+	full = t.mode == "full" || (t.pushes+1)%t.fullEach == 0
 	for id, ips := range current {
 		if len(ips) == 0 {
 			continue
@@ -56,6 +56,7 @@ func (t *aliveTracker) pending(current map[int64][]string) (batch []panel.AliveI
 func (t *aliveTracker) commit(current map[int64][]string, full bool) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
+	t.pushes++
 	for id, ips := range current {
 		if len(ips) == 0 {
 			continue
@@ -83,6 +84,12 @@ func ipKey(ips []string) string {
 func (a *Agent) pushAliveIP(ctx context.Context) error {
 	a.mu.Lock()
 	engine := a.engine
+	a.mu.Unlock()
+	return a.pushAliveWithEngine(ctx, engine)
+}
+
+func (a *Agent) pushAliveWithEngine(ctx context.Context, engine *xray.Engine) error {
+	a.mu.Lock()
 	tracker := a.alive
 	a.mu.Unlock()
 	if engine == nil || tracker == nil {

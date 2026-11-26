@@ -52,7 +52,13 @@ type Rules struct {
 	cfg   Config
 
 	cacheMu sync.Mutex
-	cache   map[string]cacheEntry
+	cache   map[matchCacheKey]cacheEntry
+}
+
+type matchCacheKey struct {
+	domain string
+	ip     string
+	port   int
 }
 
 type cacheEntry struct {
@@ -250,7 +256,7 @@ func parseOne(id int64, raw string, mode Mode) (compiled, error) {
 	case ModePrefixed:
 		return compiled{}, fmt.Errorf("rule has no recognized prefix")
 	case ModeRegex:
-		re, err := regexp.Compile(raw)
+		re, err := regexpCompile(raw)
 		if err != nil {
 			return compiled{}, err
 		}
@@ -261,7 +267,7 @@ func parseOne(id int64, raw string, mode Mode) (compiled, error) {
 		return c, nil
 	default: // auto
 		if looksRegex(raw) {
-			re, err := regexp.Compile(raw)
+			re, err := regexpCompile(raw)
 			if err != nil {
 				return compiled{}, err
 			}
@@ -295,7 +301,7 @@ func parsePrefixed(c compiled, prefix, value string) (compiled, bool, error) {
 	case "geosite", "geoip":
 		return compiled{}, false, fmt.Errorf("geosite/geoip is not enabled in this build")
 	case "regexp":
-		re, err := regexp.Compile(value)
+		re, err := regexpCompile(value)
 		if err != nil {
 			return compiled{}, true, err
 		}
@@ -389,7 +395,12 @@ func parseCIDRs(value string) ([]*net.IPNet, error) {
 // looksRegex avoids treating ordinary dotted domains as regexes. Only clear
 // regex metacharacters trigger the regex path in auto mode.
 func regexpCompile(s string) (*regexp.Regexp, error) {
-	return regexp.Compile(s)
+	// Validate original pattern first so syntax errors never get masked by
+	// wrapping, then compile case-insensitively because Match() lowercases.
+	if _, err := regexp.Compile(s); err != nil {
+		return nil, err
+	}
+	return regexp.Compile("(?i:" + s + ")")
 }
 
 func looksRegex(s string) bool {
@@ -400,34 +411,26 @@ func looksRegex(s string) bool {
 // Rule order follows the panel order.
 func (r *Rules) Match(domain string, ip net.IP, port int) (id int64, white bool, ok bool) {
 	domain = strings.ToLower(strings.TrimSuffix(strings.TrimSpace(domain), "."))
-	key := domain
+	key := matchCacheKey{domain: domain, port: port}
 	if ip != nil {
-		key += "|" + ip.String()
+		key.ip = ip.String()
 	}
-	if key == "" {
-		key = "any"
-	}
-	key += "|" + strconv.Itoa(port)
-	if key != "|" {
-		r.cacheMu.Lock()
-		if e, found := r.cache[key]; found && time.Since(e.at) < 30*time.Second {
-			r.cacheMu.Unlock()
-			return e.id, e.white, e.ok
-		}
+	r.cacheMu.Lock()
+	if e, found := r.cache[key]; found && time.Since(e.at) < 30*time.Second {
 		r.cacheMu.Unlock()
+		return e.id, e.white, e.ok
 	}
+	r.cacheMu.Unlock()
 	id, white, ok = r.match(domain, ip, port)
-	if key != "|" {
-		r.cacheMu.Lock()
-		if r.cache == nil {
-			r.cache = make(map[string]cacheEntry)
-		}
-		if len(r.cache) > 10000 {
-			r.cache = make(map[string]cacheEntry)
-		}
-		r.cache[key] = cacheEntry{id: id, white: white, ok: ok, at: time.Now()}
-		r.cacheMu.Unlock()
+	r.cacheMu.Lock()
+	if r.cache == nil {
+		r.cache = make(map[matchCacheKey]cacheEntry)
 	}
+	if len(r.cache) > 10000 {
+		r.cache = make(map[matchCacheKey]cacheEntry)
+	}
+	r.cache[key] = cacheEntry{id: id, white: white, ok: ok, at: time.Now()}
+	r.cacheMu.Unlock()
 	return id, white, ok
 }
 

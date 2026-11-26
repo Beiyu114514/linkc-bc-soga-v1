@@ -294,6 +294,8 @@ func (c *Config) Normalize() error {
 	}
 	if c.Node.Listen == "" {
 		c.Node.Listen = "0.0.0.0"
+	} else if strings.EqualFold(strings.TrimSpace(c.Node.Listen), "localhost") {
+		c.Node.Listen = "127.0.0.1"
 	}
 	if c.Node.PullInterval <= 0 {
 		c.Node.PullInterval = Duration(60 * time.Second)
@@ -375,7 +377,7 @@ func (c Config) Validate() error {
 	if c.Panel.FollowRedirects {
 		return fmt.Errorf("panel.follow_redirects is not supported (avoids leaking API-KEY)")
 	}
-	if ip := net.ParseIP(c.Node.Listen); ip == nil && c.Node.Listen != "localhost" {
+	if ip := net.ParseIP(c.Node.Listen); ip == nil {
 		return fmt.Errorf("node.listen must be an IP address, got %q", c.Node.Listen)
 	}
 	if c.Node.Limits.Mode != "enforce" && c.Node.Limits.Mode != "report" && c.Node.Limits.Mode != "off" {
@@ -404,7 +406,7 @@ func (c Config) Validate() error {
 			return fmt.Errorf("node.tls.ech_server_keys must be base64: %w", err)
 		}
 	}
-	if d := c.Node.VLESS.Decryption; d != "" && (len(d) > 256 || strings.ContainsAny(d, "\x00\r\n \t")) {
+	if d := c.Node.VLESS.Decryption; d != "" && (len(d) > 8192 || strings.ContainsAny(d, "\x00\r\n \t")) {
 		return fmt.Errorf("node.vless.decryption contains invalid characters")
 	}
 	if m := c.Node.XHTTP.Mode; m != "" && m != "auto" && m != "packet-up" && m != "stream-up" && m != "stream-one" {

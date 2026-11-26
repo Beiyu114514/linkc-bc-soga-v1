@@ -1,9 +1,14 @@
 package store
 
 import (
+	"encoding/json"
+	"errors"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
+
+	bolt "go.etcd.io/bbolt"
 )
 
 func TestETagAndLastGood(t *testing.T) {
@@ -131,5 +136,74 @@ func TestOpenReadOnly(t *testing.T) {
 	}
 	if _, err := OpenReadOnly(filepath.Join(t.TempDir(), "missing.db")); err == nil {
 		t.Fatal("expected error opening missing DB read-only")
+	}
+}
+
+func TestCloseConcurrentSafety(t *testing.T) {
+	s, err := Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var wg sync.WaitGroup
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			for j := 0; j < 20; j++ {
+				_ = s.PutLastGood("k", map[string]int{"id": id})
+				var out map[string]int
+				_, _ = s.GetLastGood("k", &out)
+				_, _, _ = s.GetETag("/node")
+				_, _ = s.PendingTraffic(10)
+				_, _ = s.PendingBytes()
+			}
+		}(i)
+	}
+	time.Sleep(2 * time.Millisecond)
+	if err := s.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	wg.Wait()
+
+	if err := s.Close(); err != nil {
+		t.Fatalf("second Close: %v", err)
+	}
+	if err := s.PutLastGood("k", 1); !errors.Is(err, ErrClosed) {
+		t.Fatalf("PutLastGood after Close = %v, want ErrClosed", err)
+	}
+	if _, _, err := s.GetETag("/node"); !errors.Is(err, ErrClosed) {
+		t.Fatalf("GetETag after Close = %v, want ErrClosed", err)
+	}
+	if _, err := s.AppendTraffic([]TrafficDelta{{UserID: 1, Up: 10}}); !errors.Is(err, ErrClosed) {
+		t.Fatalf("AppendTraffic after Close = %v, want ErrClosed", err)
+	}
+}
+
+func TestGetETagDetectsCorruptSHA256(t *testing.T) {
+	s, err := Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	if err := s.PutETag("/node", ETagRecord{ETag: `"e1"`, Body: []byte(`{"ok":true}`)}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.update(func(tx *bolt.Tx) error {
+		b := tx.Bucket(bucketETag)
+		var rec ETagRecord
+		if err := json.Unmarshal(b.Get([]byte("/node")), &rec); err != nil {
+			return err
+		}
+		rec.SHA256 = "00000000000000000000000000000000"
+		raw, err := json.Marshal(rec)
+		if err != nil {
+			return err
+		}
+		return b.Put([]byte("/node"), raw)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok, err := s.GetETag("/node"); err == nil || ok {
+		t.Fatalf("corrupt SHA256 must return checksum error and ok=false: ok=%v err=%v", ok, err)
 	}
 }

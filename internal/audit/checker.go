@@ -20,6 +20,7 @@ type Checker struct {
 	mu    sync.RWMutex
 	rules *Rules
 	cfg   Config
+	geoMu sync.Mutex
 	geo   *GeoData
 	st    *store.Store
 	log   *slog.Logger
@@ -62,19 +63,19 @@ func New(st *store.Store, cfg Config, log *slog.Logger) *Checker {
 
 // Update compiles and swaps the rule set. On failure the old set is kept.
 func (c *Checker) Update(raw []panel.AuditRule, white []string) (Stats, error) {
-	if c.cfg.GeodataDir != "" && c.geo == nil && needsGeodata(raw, white) {
-		geo, err := LoadGeodata(c.cfg.GeodataDir)
-		if err != nil {
-			// LoadGeodata returns a partially filled (or empty) GeoData together
-			// with the error. Caching it would disable geo rules until restart,
-			// so keep c.geo nil and retry on the next Update.
+	needSite, needIP := needsGeodataKinds(raw, white)
+	c.geoMu.Lock()
+	if c.cfg.GeodataDir != "" && (needSite || needIP) {
+		if c.geo == nil {
+			c.geo = newGeoData()
+		}
+		if err := c.geo.EnsureLoaded(c.cfg.GeodataDir, needSite, needIP); err != nil {
 			c.log.Warn("load geodata", "dir", c.cfg.GeodataDir, "error", err)
-		} else {
-			c.geo = geo
 		}
 	}
 	cfg := c.cfg
 	cfg.Geo = c.geo
+	c.geoMu.Unlock()
 	rules, stats, err := Compile(raw, white, cfg)
 	if err != nil {
 		return stats, err
@@ -112,20 +113,35 @@ func (c *Checker) Check(ctx context.Context, userID int64, dest xnet.Destination
 	var ruleID int64
 	var white, ok bool
 	if ip == nil && domain != "" && c.cfg.ResolveDomain && rules.HasIPRules() {
-		matched := false
+		var whiteHit bool
+		var whiteIP net.IP
+		var blockedHit bool
 		for _, candidate := range c.resolve(domain) {
-			ruleID, white, ok = rules.Match(domain, candidate, int(dest.Port))
-			if ok {
+			rid, w, matched := rules.Match(domain, candidate, int(dest.Port))
+			if !matched {
+				continue
+			}
+			if !w {
+				ruleID, white, ok = rid, false, true
 				ip = candidate
-				matched = true
+				blockedHit = true
 				break
 			}
+			if !whiteHit {
+				whiteHit = true
+				whiteIP = candidate
+			}
 		}
-		if !matched {
-			// DNS failed or no IP rule matched: still consult the domain,
-			// keyword, regexp and port rules. Skipping them here would turn a
-			// resolver outage into an audit bypass (fail-open).
-			ruleID, white, ok = rules.Match(domain, nil, int(dest.Port))
+		if !blockedHit {
+			if whiteHit {
+				ruleID, white, ok = 0, true, true
+				ip = whiteIP
+			} else {
+				// DNS failed or no IP rule matched: still consult the domain,
+				// keyword, regexp and port rules. Skipping them here would turn a
+				// resolver outage into an audit bypass (fail-open).
+				ruleID, white, ok = rules.Match(domain, nil, int(dest.Port))
+			}
 		}
 	} else {
 		ruleID, white, ok = rules.Match(domain, ip, int(dest.Port))

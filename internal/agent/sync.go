@@ -93,12 +93,12 @@ func (a *Agent) Sync(ctx context.Context) error {
 	if rawNode != nil {
 		sp, err := node.FromPanel(*rawNode)
 		if err != nil {
-			a.setApplyError(err)
+			a.setApplyError("node", err)
 			nodeErr = errors.Join(nodeErr, fmt.Errorf("validate node: %w", err))
 		} else {
 			nxc, err := sp.Xray(a.localRuntime())
 			if err != nil {
-				a.setApplyError(err)
+				a.setApplyError("node", err)
 				nodeErr = errors.Join(nodeErr, fmt.Errorf("build xray config: %w", err))
 			} else {
 				spec, xc, nodeUpdated = sp, nxc, true
@@ -111,7 +111,7 @@ func (a *Agent) Sync(ctx context.Context) error {
 	if usersFetched {
 		us, stats, err := node.NormalizeUsers(rawUsers, a.userOptions(), curUsers)
 		if err != nil {
-			a.setApplyError(err)
+			a.setApplyError("users", err)
 			usersErr = errors.Join(usersErr, fmt.Errorf("normalize users: %w", err))
 		} else {
 			nextUsers, usersUpdated = us, true
@@ -142,9 +142,13 @@ func (a *Agent) Sync(ctx context.Context) error {
 			nodeUpdated = false
 			if err != nil {
 				applyErr = errors.Join(applyErr, fmt.Errorf("swap inbound: %w", err))
-				a.setApplyError(err)
+				a.setApplyError("node", err)
 				a.log.Warn("inbound swapped with warning", "warning", rep.Warning, "error", err)
 			} else {
+				a.setApplyError("node", nil)
+				if usersUpdated {
+					a.setApplyError("users", nil)
+				}
 				if rep.Warning != "" {
 					a.log.Warn("inbound swap warning", "warning", rep.Warning)
 				}
@@ -154,13 +158,13 @@ func (a *Agent) Sync(ctx context.Context) error {
 			// The engine restored the previous inbound; keep agent state
 			// unchanged and retry on the next pull.
 			applyErr = errors.Join(applyErr, fmt.Errorf("swap inbound: %w", err))
-			a.setApplyError(err)
+			a.setApplyError("node", err)
 			nodeUpdated = false
 			a.log.Warn("inbound swap rolled back", "error", err)
 		default:
 			// Add failed or there is no listener: keep the old state and retry.
 			applyErr = errors.Join(applyErr, fmt.Errorf("swap inbound: %w", err))
-			a.setApplyError(err)
+			a.setApplyError("node", err)
 			nodeUpdated = false
 			if rep.Tag == "" {
 				a.mu.Lock()
@@ -183,14 +187,16 @@ func (a *Agent) Sync(ctx context.Context) error {
 		a.updateIntervalsLocked(spec)
 		a.mu.Unlock()
 		a.saveNode(spec)
+		a.setApplyError("node", nil)
 	}
 
 	if usersChanged && !usersApplied {
 		a.collect(ctx)
 		if err := engine.ApplyUsers(ctx, nextUsers); err != nil {
 			applyErr = errors.Join(applyErr, fmt.Errorf("apply users: %w", err))
-			a.setApplyError(err)
+			a.setApplyError("users", err)
 		} else {
+			a.setApplyError("users", nil)
 			a.mu.Lock()
 			a.users, a.usersFP = nextUsers, node.UsersFingerprint(nextUsers)
 			a.hasUsers = true
@@ -198,6 +204,8 @@ func (a *Agent) Sync(ctx context.Context) error {
 			a.saveUsers(nextUsers)
 		}
 		a.collect(ctx)
+	} else if usersUpdated && !usersChanged {
+		a.setApplyError("users", nil)
 	}
 
 	if a.audit != nil {
@@ -227,10 +235,11 @@ func (a *Agent) Sync(ctx context.Context) error {
 			stats, err := a.audit.Update(rawRules, merged)
 			if err != nil {
 				rulesErr = errors.Join(rulesErr, fmt.Errorf("apply audit rules: %w", err))
-				a.setApplyError(err)
+				a.setApplyError("audit", err)
 				// Retry on the next pull: the fetched version is not live yet.
 				a.setAuditPending(true)
 			} else {
+				a.setApplyError("audit", nil)
 				// Only advance the local whitelist once the new set is live, so it
 				// never leads the applied rules.
 				if localChanged {

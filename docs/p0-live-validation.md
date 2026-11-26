@@ -41,8 +41,8 @@ node:
     rule_mode: "auto"
   users:
     allow_empty: true
-status:
-  mode: "load_fraction"
+  status:
+    mode: "load_fraction"
 ```
 
 ```bash

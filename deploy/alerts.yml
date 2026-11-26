@@ -27,13 +27,13 @@ groups:
           description: "Three or more consecutive panel failures. The data plane keeps serving, but config/user updates are stale."
 
       - alert: LinkCTrafficBacklog
-        expr: linkc_traffic_pending_bytes > 100e6
+        expr: linkc_traffic_pending_bytes > 50e6
         for: 15m
         labels:
           severity: warning
         annotations:
           summary: "linkc-node {{ $labels.instance }} traffic backlog"
-          description: "More than 100MB of traffic is waiting to be reported for 15 minutes. Panel reachability or journal size may be the cause."
+          description: "More than 50MB of traffic is waiting to be reported for 15 minutes. Panel reachability or journal size may be the cause."
 
       - alert: LinkCAuditBacklog
         expr: linkc_audit_pending > 1000
@@ -54,7 +54,7 @@ groups:
           description: "An empty user list is legal (quota/bandwidth cap), but a prolonged zero may indicate a panel-side problem."
 
       - alert: LinkCLimitRejectsSpike
-        expr: increase(linkc_limit_rejects_total[10m]) > 100
+        expr: sum without (reason) (increase(linkc_limit_rejects_total[10m])) > 100
         for: 0m
         labels:
           severity: warning

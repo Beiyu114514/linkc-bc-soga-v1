@@ -18,6 +18,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -421,5 +422,160 @@ func TestBuildConfigMultipleCertificates(t *testing.T) {
 	certs := tls["certificates"].([]any)
 	if len(certs) != 2 {
 		t.Fatalf("certificates = %d", len(certs))
+	}
+}
+
+func TestApplyUsersConcurrentWithSwapInbound(t *testing.T) {
+	ctx := context.Background()
+	e, err := xray.Start(ctx, baseNode(freePort(t)), []xray.User{{ID: 1, UUID: testUUID}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer e.Close()
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 6; i++ {
+			_ = e.ApplyUsers(ctx, []xray.User{{ID: 1, UUID: testUUID, SpeedLimit: float64(i + 1)}})
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 3; i++ {
+			_, _ = e.SwapInbound(ctx, baseNode(freePort(t)), []xray.User{{ID: 1, UUID: testUUID}})
+		}
+	}()
+	wg.Wait()
+}
+
+func TestDeviceLimitZeroToPositiveNoUnderflow(t *testing.T) {
+	port := freePort(t)
+	ctx := context.Background()
+	e, err := xray.Start(ctx, baseNode(port), []xray.User{{ID: 1, UUID: testUUID, DeviceLimit: 0}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer e.Close()
+
+	socksPort := freePort(t)
+	c, err := m0engine.StartClient(ctx, m0engine.ClientConfig{
+		SocksPort: socksPort, Server: "127.0.0.1", Port: port, UUID: testUUID,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		close(entered)
+		<-release
+		_, _ = io.WriteString(w, "ok")
+	}))
+	defer target.Close()
+
+	done := make(chan error, 1)
+	go func() {
+		resp, err := socksClient(t, socksPort).Get(target.URL)
+		if err != nil {
+			done <- err
+			return
+		}
+		resp.Body.Close()
+		done <- nil
+	}()
+	<-entered
+
+	// Raise device limit from 0 -> 1 while the first connection is active.
+	if err := e.ApplyUsers(ctx, []xray.User{{ID: 1, UUID: testUUID, DeviceLimit: 1}}); err != nil {
+		close(release)
+		t.Fatal(err)
+	}
+	close(release)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	// Ensure device counters never underflow back above 0 after close.
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if e.Gate().Metrics().Devices == 0 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if got := e.Gate().Metrics().Devices; got != 0 {
+		t.Fatalf("active devices after close = %d, want 0", got)
+	}
+}
+
+func TestReadTrafficDrainsRemovedUserBytes(t *testing.T) {
+	port := freePort(t)
+	ctx := context.Background()
+	e, err := xray.Start(ctx, baseNode(port), []xray.User{{ID: 1, UUID: testUUID}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer e.Close()
+
+	socksPort := freePort(t)
+	c, err := m0engine.StartClient(ctx, m0engine.ClientConfig{
+		SocksPort: socksPort, Server: "127.0.0.1", Port: port, UUID: testUUID,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, strings.Repeat("x", 4096))
+	}))
+	defer target.Close()
+	resp, err := socksClient(t, socksPort).Get(target.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = io.ReadAll(resp.Body)
+	resp.Body.Close()
+
+	// Remove user 1 BEFORE ReadTraffic is called.
+	if err := e.ApplyUsers(ctx, nil); err != nil {
+		t.Fatal(err)
+	}
+	stats := e.ReadTraffic()
+	if stats[1].Up+stats[1].Down == 0 {
+		t.Fatalf("expected non-zero drained traffic for removed user 1, got %+v", stats)
+	}
+}
+
+func TestFreedomBlocksPrivateTargetWhenDisabled(t *testing.T) {
+	port := freePort(t)
+	n := baseNode(port)
+	n.AllowPrivate = false
+	ctx := context.Background()
+	e, err := xray.Start(ctx, n, []xray.User{{ID: 1, UUID: testUUID}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer e.Close()
+
+	socksPort := freePort(t)
+	c, err := m0engine.StartClient(ctx, m0engine.ClientConfig{
+		SocksPort: socksPort, Server: "127.0.0.1", Port: port, UUID: testUUID,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, "should-not-reach")
+	}))
+	defer target.Close()
+	if resp, err := socksClient(t, socksPort).Get(target.URL); err == nil {
+		resp.Body.Close()
+		t.Fatal("expected loopback target to be blocked when AllowPrivate=false")
 	}
 }

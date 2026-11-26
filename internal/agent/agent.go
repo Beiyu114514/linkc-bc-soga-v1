@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"math/rand/v2"
 	"os"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -88,6 +89,7 @@ type Agent struct {
 	closed    bool
 	degraded  bool
 	failures  map[string]int
+	applyErr  map[string]error
 	lastOK    map[string]time.Time
 	lastErr   error
 	startedAt time.Time
@@ -166,6 +168,7 @@ func New(cfg config.Config, logger *slog.Logger) (*Agent, error) {
 		pushEvery:    cfg.Node.PushInterval.Duration(),
 		statusEvery:  cfg.Node.StatusInterval.Duration(),
 		failures:     make(map[string]int),
+		applyErr:     make(map[string]error),
 		lastOK:       make(map[string]time.Time),
 		startedAt:    time.Now(),
 	}
@@ -327,12 +330,15 @@ func (a *Agent) Run(ctx context.Context) error {
 
 // Close stops Xray and closes the store. Safe to call after Run.
 func (a *Agent) Close() error {
+	a.applyMu.Lock()
+	defer a.applyMu.Unlock()
 	a.mu.Lock()
 	if a.closed {
 		a.mu.Unlock()
 		return nil
 	}
 	a.closed = true
+	a.stopped = true
 	a.ready = false
 	engine := a.engine
 	a.engine = nil
@@ -366,13 +372,14 @@ func (a *Agent) Snapshot() Snapshot {
 	for k, v := range a.lastOK {
 		s.LastSuccess[k] = v.Format(time.RFC3339)
 	}
+	closed := a.closed
 	tm := a.trafficMgr
 	checker := a.audit
 	a.mu.Unlock()
-	if tm != nil {
+	if !closed && tm != nil {
 		s.PendingBytes = tm.PendingBytes()
 	}
-	if checker != nil {
+	if !closed && checker != nil {
 		st := checker.Stats()
 		s.AuditRules = checker.Rules().Len()
 		s.AuditHits = st.Hits
@@ -610,16 +617,7 @@ func (a *Agent) recordSuccess(endpoint string) {
 	defer a.mu.Unlock()
 	a.failures[endpoint] = 0
 	a.lastOK[endpoint] = time.Now()
-	allOK := true
-	for _, n := range a.failures {
-		if n > 0 {
-			allOK = false
-			break
-		}
-	}
-	if allOK {
-		a.lastErr = nil
-	}
+	a.recomputeLastErrLocked()
 	a.updateDegradedLocked()
 }
 
@@ -627,17 +625,43 @@ func (a *Agent) recordFailure(endpoint string, err error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	a.failures[endpoint]++
-	a.lastErr = err
+	if err != nil {
+		a.lastErr = err
+	}
 	a.updateDegradedLocked()
 }
 
-func (a *Agent) setApplyError(err error) {
+func (a *Agent) setApplyError(kind string, err error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.applyErr == nil {
+		a.applyErr = make(map[string]error)
+	}
 	if err == nil {
+		delete(a.applyErr, kind)
+		a.recomputeLastErrLocked()
 		return
 	}
-	a.mu.Lock()
+	a.applyErr[kind] = err
 	a.lastErr = err
-	a.mu.Unlock()
+}
+
+func (a *Agent) recomputeLastErrLocked() {
+	for _, n := range a.failures {
+		if n > 0 {
+			return
+		}
+	}
+	if len(a.applyErr) == 0 {
+		a.lastErr = nil
+		return
+	}
+	keys := make([]string, 0, len(a.applyErr))
+	for k := range a.applyErr {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	a.lastErr = a.applyErr[keys[0]]
 }
 
 // setAuditPending marks whether a fetched audit rule set still has to be
@@ -677,24 +701,28 @@ func (a *Agent) shutdown() {
 	a.applyMu.Lock()
 	a.mu.Lock()
 	a.stopped = true
+	engine := a.engine
+	a.engine = nil
+	a.ready = false
 	a.mu.Unlock()
 	defer a.applyMu.Unlock()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	a.collect(ctx)
-	if err := a.Push(ctx); err != nil {
-		a.log.Warn("final push", "error", err)
-	}
-	a.mu.Lock()
-	engine := a.engine
-	a.engine = nil
-	a.ready = false
-	a.mu.Unlock()
+	// Flush online IPs before closing Xray (Close tears down OnlineMaps).
 	if engine != nil {
+		if err := a.pushAliveWithEngine(ctx, engine); err != nil {
+			a.log.Warn("final alive_ip push", "error", err)
+		}
 		if err := engine.Close(); err != nil {
 			a.log.Warn("close xray", "error", err)
 		}
+	}
+	// Collect and push after engine.Close() so final bytes on closing
+	// connections are included before the process exits.
+	a.collect(ctx)
+	if err := a.Push(ctx); err != nil {
+		a.log.Warn("final push", "error", err)
 	}
 }
 
@@ -829,9 +857,12 @@ func (a *Agent) Push(ctx context.Context) error {
 		}
 		if n, err := tm.Push(ctx, a.panel, a.cfg.Node.Traffic.BatchUsers, a.cfg.Node.Traffic.BatchBytes); err != nil {
 			firstErr = err
-			a.setApplyError(err)
-		} else if n > 0 {
-			a.log.Debug("traffic pushed", "bytes", n)
+			a.setApplyError("traffic", err)
+		} else {
+			a.setApplyError("traffic", nil)
+			if n > 0 {
+				a.log.Debug("traffic pushed", "bytes", n)
+			}
 		}
 	}
 	if a.cfg.Node.Traffic.IncludeOnlineZero {
@@ -843,12 +874,21 @@ func (a *Agent) Push(ctx context.Context) error {
 			for id := range engine.OnlineIPs() {
 				zeros = append(zeros, panel.Traffic{ID: id, U: 0, D: 0})
 			}
-			if len(zeros) > 0 {
-				if err := a.panel.PushTraffic(ctx, zeros); err != nil {
+			batchUsers := a.cfg.Node.Traffic.BatchUsers
+			if batchUsers <= 0 {
+				batchUsers = 500
+			}
+			for start := 0; start < len(zeros); start += batchUsers {
+				end := start + batchUsers
+				if end > len(zeros) {
+					end = len(zeros)
+				}
+				if err := a.panel.PushTraffic(ctx, zeros[start:end]); err != nil {
 					if firstErr == nil {
 						firstErr = fmt.Errorf("traffic online-zero: %w", err)
 					}
-					a.setApplyError(err)
+					a.setApplyError("traffic", err)
+					break
 				}
 			}
 		}

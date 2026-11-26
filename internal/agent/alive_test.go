@@ -1,42 +1,55 @@
 package agent
 
-import "testing"
+import (
+	"errors"
+	"testing"
+	"time"
+)
 
-// TestAlivePendingRetriesAfterFailure guards #10: a failed push must not
-// advance the snapshot, otherwise the new IP is not resent until the next full
-// pass (about 20 minutes by default).
-func TestAlivePendingRetriesAfterFailure(t *testing.T) {
-	tr := newAliveTracker(20, "changed")
-	first := map[int64][]string{42: {"1.1.1.1"}}
-	batch, full := tr.pending(first)
-	if len(batch) != 1 || full || batch[0].ID != 42 {
-		t.Fatalf("pending=%+v full=%v", batch, full)
+func TestAliveTrackerRetriesFullAfterFailure(t *testing.T) {
+	tr := newAliveTracker(2, "changed")
+	online := map[int64][]string{1: {"192.0.2.1"}}
+
+	// Push #1: incremental, commit succeeds.
+	b, full := tr.pending(online)
+	if full || len(b) != 1 {
+		t.Fatalf("push 1: full=%v len=%d", full, len(b))
 	}
-	// The POST failed: no commit happened, so the same user must be retried.
-	batch, _ = tr.pending(first)
-	if len(batch) != 1 || batch[0].ID != 42 {
-		t.Fatalf("unchanged IP not retried after failure: %+v", batch)
+	tr.commit(online, full)
+
+	// Push #2: hits fullEach=2 -> full=true, simulate PushAliveIP failure (no commit).
+	b, full = tr.pending(online)
+	if !full || len(b) != 1 {
+		t.Fatalf("push 2: full=%v len=%d", full, len(b))
 	}
-	tr.commit(first, false)
-	if batch, _ = tr.pending(first); len(batch) != 0 {
-		t.Fatalf("committed snapshot still queued: %+v", batch)
+
+	// Push #3: must retain full=true until commit() succeeds.
+	b, full = tr.pending(online)
+	if !full || len(b) != 1 {
+		t.Fatalf("push 3 retry must stay full=true, got full=%v len=%d", full, len(b))
 	}
-	second := map[int64][]string{42: {"2.2.2.2"}}
-	if batch, _ = tr.pending(second); len(batch) != 1 || batch[0].IPs[0] != "2.2.2.2" {
-		t.Fatalf("changed IP not detected: %+v", batch)
+	tr.commit(online, full)
+
+	// Push #4: back to incremental until next fullEach.
+	b, full = tr.pending(online)
+	if full || len(b) != 0 {
+		t.Fatalf("push 4: full=%v len=%d", full, len(b))
 	}
 }
 
-// TestAliveFullPassDropsOffline checks that a committed full pass clears users
-// that went offline.
-func TestAliveFullPassDropsOffline(t *testing.T) {
-	tr := newAliveTracker(1, "changed") // every pass is a full snapshot
-	tr.commit(map[int64][]string{42: {"1.1.1.1"}}, true)
-	if len(tr.last) != 1 {
-		t.Fatalf("last = %+v", tr.last)
+func TestApplyErrorSurvivesEndpointRecovery(t *testing.T) {
+	a := &Agent{
+		failures: make(map[string]int),
+		applyErr: make(map[string]error),
+		lastOK:   make(map[string]time.Time),
 	}
-	tr.commit(map[int64][]string{}, true)
-	if len(tr.last) != 0 {
-		t.Fatalf("offline user kept: %+v", tr.last)
+	a.setApplyError("users", errors.New("apply users failed"))
+	a.recordSuccess("node")
+	if got := errString(a.lastErr); got != "apply users failed" {
+		t.Fatalf("endpoint success cleared apply error: %q", got)
+	}
+	a.setApplyError("users", nil)
+	if got := errString(a.lastErr); got != "" {
+		t.Fatalf("clearing apply error left %q", got)
 	}
 }

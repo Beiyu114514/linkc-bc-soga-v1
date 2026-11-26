@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 
 	xgeodata "github.com/xtls/xray-core/common/geodata"
 
@@ -16,95 +17,137 @@ import (
 
 // GeoData is a lazily loaded subset of Xray geosite.dat / geoip.dat.
 type GeoData struct {
-	sites map[string][]*xgeodata.Domain
-	ips   map[string][]*net.IPNet
+	mu          sync.RWMutex
+	sitesLoaded bool
+	ipsLoaded   bool
+	sites       map[string][]*xgeodata.Domain
+	ips         map[string][]*net.IPNet
+}
+
+func newGeoData() *GeoData {
+	return &GeoData{
+		sites: make(map[string][]*xgeodata.Domain),
+		ips:   make(map[string][]*net.IPNet),
+	}
 }
 
 // LoadGeodata reads geosite.dat and geoip.dat from dir. Missing files are
 // returned as errors, but any successfully loaded file remains usable.
 func LoadGeodata(dir string) (*GeoData, error) {
-	g := &GeoData{sites: make(map[string][]*xgeodata.Domain), ips: make(map[string][]*net.IPNet)}
+	g := newGeoData()
+	err := g.EnsureLoaded(dir, true, true)
+	return g, err
+}
+
+// EnsureLoaded loads geosite.dat and/or geoip.dat when requested and not yet loaded.
+func (g *GeoData) EnsureLoaded(dir string, needSites, needIPs bool) error {
 	var errs []error
-	if b, err := os.ReadFile(filepath.Join(dir, "geosite.dat")); err != nil {
-		errs = append(errs, fmt.Errorf("geosite.dat: %w", err))
-	} else {
-		var list xgeodata.GeoSiteList
-		if err := proto.Unmarshal(b, &list); err != nil {
+	g.mu.Lock()
+	sitesNeeded := needSites && !g.sitesLoaded
+	ipsNeeded := needIPs && !g.ipsLoaded
+	g.mu.Unlock()
+
+	if sitesNeeded {
+		if b, err := os.ReadFile(filepath.Join(dir, "geosite.dat")); err != nil {
 			errs = append(errs, fmt.Errorf("geosite.dat: %w", err))
 		} else {
-			for _, e := range list.Entry {
-				if e.GetCode() != "" {
-					g.sites[strings.ToLower(e.GetCode())] = e.GetDomain()
+			var list xgeodata.GeoSiteList
+			if err := proto.Unmarshal(b, &list); err != nil {
+				errs = append(errs, fmt.Errorf("geosite.dat: %w", err))
+			} else {
+				sites := make(map[string][]*xgeodata.Domain, len(list.Entry))
+				for _, e := range list.Entry {
+					if e.GetCode() != "" {
+						sites[strings.ToLower(e.GetCode())] = e.GetDomain()
+					}
 				}
+				g.mu.Lock()
+				g.sites = sites
+				g.sitesLoaded = true
+				g.mu.Unlock()
 			}
 		}
 	}
-	if b, err := os.ReadFile(filepath.Join(dir, "geoip.dat")); err != nil {
-		errs = append(errs, fmt.Errorf("geoip.dat: %w", err))
-	} else {
-		var list xgeodata.GeoIPList
-		if err := proto.Unmarshal(b, &list); err != nil {
+	if ipsNeeded {
+		if b, err := os.ReadFile(filepath.Join(dir, "geoip.dat")); err != nil {
 			errs = append(errs, fmt.Errorf("geoip.dat: %w", err))
 		} else {
-			for _, e := range list.Entry {
-				if e.GetCode() == "" {
-					continue
-				}
-				var nets []*net.IPNet
-				for _, c := range e.GetCidr() {
-					bits := len(c.GetIp()) * 8
-					if bits != 32 && bits != 128 {
+			var list xgeodata.GeoIPList
+			if err := proto.Unmarshal(b, &list); err != nil {
+				errs = append(errs, fmt.Errorf("geoip.dat: %w", err))
+			} else {
+				ips := make(map[string][]*net.IPNet, len(list.Entry))
+				for _, e := range list.Entry {
+					if e.GetCode() == "" {
 						continue
 					}
-					mask := net.CIDRMask(int(c.GetPrefix()), bits)
-					if mask == nil {
-						continue
+					var nets []*net.IPNet
+					for _, c := range e.GetCidr() {
+						bits := len(c.GetIp()) * 8
+						if bits != 32 && bits != 128 {
+							continue
+						}
+						mask := net.CIDRMask(int(c.GetPrefix()), bits)
+						if mask == nil {
+							continue
+						}
+						ip := net.IP(c.GetIp())
+						nets = append(nets, &net.IPNet{IP: ip.Mask(mask), Mask: mask})
 					}
-					ip := net.IP(c.GetIp())
-					nets = append(nets, &net.IPNet{IP: ip.Mask(mask), Mask: mask})
+					ips[strings.ToLower(e.GetCode())] = nets
 				}
-				g.ips[strings.ToLower(e.GetCode())] = nets
+				g.mu.Lock()
+				g.ips = ips
+				g.ipsLoaded = true
+				g.mu.Unlock()
 			}
 		}
 	}
-	return g, errors.Join(errs...)
+	return errors.Join(errs...)
 }
 
-func needsGeodata(rules []panel.AuditRule, white []string) bool {
-	for _, r := range rules {
-		if hasGeoPrefix(r.Rule) {
-			return true
+func needsGeodataKinds(rules []panel.AuditRule, white []string) (needSite, needIP bool) {
+	check := func(raw string) {
+		p, _, ok := splitPrefix(strings.TrimSpace(raw))
+		if !ok {
+			return
 		}
+		if p == "geosite" {
+			needSite = true
+		} else if p == "geoip" {
+			needIP = true
+		}
+	}
+	for _, r := range rules {
+		check(r.Rule)
 	}
 	for _, w := range white {
-		if hasGeoPrefix(w) {
-			return true
-		}
+		check(w)
 	}
-	return false
-}
-
-func hasGeoPrefix(raw string) bool {
-	p, _, ok := splitPrefix(strings.TrimSpace(raw))
-	return ok && (p == "geosite" || p == "geoip")
+	return needSite, needIP
 }
 
 func (g *GeoData) compileGeo(id int64, prefix, value string) ([]compiled, error) {
 	if g == nil {
 		return nil, fmt.Errorf("%s rules require geodata.dir with geosite.dat/geoip.dat", prefix)
 	}
-	code := strings.ToLower(strings.TrimSpace(value))
-	if i := strings.IndexByte(code, '@'); i >= 0 {
-		code = code[:i]
-	}
+	rawCode := strings.ToLower(strings.TrimSpace(value))
+	code, attr, hasAttr := strings.Cut(rawCode, "@")
+	code = strings.TrimSpace(code)
+	attr = strings.TrimSpace(attr)
 	switch prefix {
 	case "geosite":
+		g.mu.RLock()
 		domains := g.sites[code]
+		g.mu.RUnlock()
 		if len(domains) == 0 {
 			return nil, fmt.Errorf("geosite code %q not found", code)
 		}
 		out := make([]compiled, 0, len(domains))
 		for _, d := range domains {
+			if hasAttr && attr != "" && !domainHasAttr(d, attr) {
+				continue
+			}
 			switch d.GetType() {
 			case xgeodata.Domain_Substr:
 				out = append(out, compiled{id: id, kind: kindKeyword, value: strings.ToLower(d.GetValue())})
@@ -120,13 +163,30 @@ func (g *GeoData) compileGeo(id int64, prefix, value string) ([]compiled, error)
 				out = append(out, compiled{id: id, kind: kindRegex, re: re})
 			}
 		}
+		if len(out) == 0 {
+			return nil, fmt.Errorf("geosite %q has no matching entries", rawCode)
+		}
 		return out, nil
 	case "geoip":
+		if hasAttr && attr != "" {
+			return nil, fmt.Errorf("geoip does not support attribute filter %q", rawCode)
+		}
+		g.mu.RLock()
 		nets := g.ips[code]
+		g.mu.RUnlock()
 		if len(nets) == 0 {
 			return nil, fmt.Errorf("geoip code %q not found", code)
 		}
 		return []compiled{{id: id, kind: kindIP, cidrs: nets}}, nil
 	}
 	return nil, fmt.Errorf("unknown geodata prefix %q", prefix)
+}
+
+func domainHasAttr(d *xgeodata.Domain, attr string) bool {
+	for _, a := range d.GetAttribute() {
+		if strings.EqualFold(a.GetKey(), attr) {
+			return true
+		}
+	}
+	return false
 }

@@ -16,7 +16,10 @@ overrides:
       - shadow-utils
       - glibc-common
 scripts:
+  preinstall: packaging/preinstall.sh
   postinstall: packaging/postinstall.sh
+  preremove: packaging/preremove.sh
+  postremove: packaging/postremove.sh
 contents:
   - src: dist/linkc-node-linux-${ARCH}
     dst: /usr/local/bin/linkc-node
@@ -26,6 +29,8 @@ contents:
       mode: 0755
   - src: deploy/linkc-node.service
     dst: /lib/systemd/system/linkc-node.service
+  - src: deploy/linkc-node@.service
+    dst: /lib/systemd/system/linkc-node@.service
   - src: configs/linkc-node.example.yaml
     dst: /etc/linkc-node/config.yaml
     type: config|noreplace

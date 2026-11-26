@@ -40,9 +40,12 @@ var (
 // ErrNotFound is returned when a requested record is absent.
 var ErrNotFound = errors.New("store: not found")
 
+// ErrClosed is returned when an operation is attempted on a closed store.
+var ErrClosed = errors.New("store: closed")
+
 // Store owns the bbolt database.
 type Store struct {
-	mu   sync.Mutex
+	mu   sync.RWMutex
 	db   *bolt.DB
 	path string
 }
@@ -146,6 +149,24 @@ func (s *Store) init() error {
 // Path returns the database path.
 func (s *Store) Path() string { return s.path }
 
+func (s *Store) view(fn func(*bolt.Tx) error) error {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.db == nil {
+		return ErrClosed
+	}
+	return s.db.View(fn)
+}
+
+func (s *Store) update(fn func(*bolt.Tx) error) error {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.db == nil {
+		return ErrClosed
+	}
+	return s.db.Update(fn)
+}
+
 // Close closes the database.
 func (s *Store) Close() error {
 	s.mu.Lock()
@@ -162,15 +183,25 @@ func (s *Store) Close() error {
 func (s *Store) GetETag(endpoint string) (ETagRecord, bool, error) {
 	var rec ETagRecord
 	found := false
-	err := s.db.View(func(tx *bolt.Tx) error {
-		v := tx.Bucket(bucketETag).Get([]byte(endpoint))
+	err := s.view(func(tx *bolt.Tx) error {
+		b := tx.Bucket(bucketETag)
+		if b == nil {
+			return nil
+		}
+		v := b.Get([]byte(endpoint))
 		if v == nil {
 			return nil
 		}
 		found = true
 		return json.Unmarshal(v, &rec)
 	})
-	return rec, found, err
+	if err != nil || !found {
+		return ETagRecord{}, false, err
+	}
+	if rec.SHA256 != hashBytes(rec.Body) {
+		return ETagRecord{}, false, fmt.Errorf("store: etag %q checksum mismatch", endpoint)
+	}
+	return rec, true, nil
 }
 
 // PutETag stores an endpoint cache entry.
@@ -183,7 +214,7 @@ func (s *Store) PutETag(endpoint string, rec ETagRecord) error {
 	if err != nil {
 		return err
 	}
-	return s.db.Update(func(tx *bolt.Tx) error {
+	return s.update(func(tx *bolt.Tx) error {
 		return tx.Bucket(bucketETag).Put([]byte(endpoint), b)
 	})
 }
@@ -192,8 +223,12 @@ func (s *Store) PutETag(endpoint string, rec ETagRecord) error {
 func (s *Store) GetLastGood(name string, out any) (bool, error) {
 	var rec LastGoodRecord
 	found := false
-	err := s.db.View(func(tx *bolt.Tx) error {
-		v := tx.Bucket(bucketLastGood).Get([]byte(name))
+	err := s.view(func(tx *bolt.Tx) error {
+		b := tx.Bucket(bucketLastGood)
+		if b == nil {
+			return nil
+		}
+		v := b.Get([]byte(name))
 		if v == nil {
 			return nil
 		}
@@ -223,7 +258,7 @@ func (s *Store) PutLastGood(name string, v any) error {
 	if err != nil {
 		return err
 	}
-	return s.db.Update(func(tx *bolt.Tx) error {
+	return s.update(func(tx *bolt.Tx) error {
 		return tx.Bucket(bucketLastGood).Put([]byte(name), b)
 	})
 }
@@ -234,7 +269,7 @@ func (s *Store) AppendTraffic(deltas []TrafficDelta) ([]uint64, error) {
 		return nil, nil
 	}
 	seqs := make([]uint64, 0, len(deltas))
-	err := s.db.Update(func(tx *bolt.Tx) error {
+	err := s.update(func(tx *bolt.Tx) error {
 		meta := tx.Bucket(bucketTrafficMeta)
 		next := uint64(1)
 		if v := meta.Get(keyNextSeq); len(v) == 8 {
@@ -280,8 +315,12 @@ func (s *Store) PendingTraffic(limit int) ([]TrafficRecord, error) {
 		limit = 500
 	}
 	var out []TrafficRecord
-	err := s.db.View(func(tx *bolt.Tx) error {
-		c := tx.Bucket(bucketTraffic).Cursor()
+	err := s.view(func(tx *bolt.Tx) error {
+		b := tx.Bucket(bucketTraffic)
+		if b == nil {
+			return nil
+		}
+		c := b.Cursor()
 		for k, v := c.First(); k != nil && len(out) < limit; k, v = c.Next() {
 			var rec TrafficRecord
 			if err := json.Unmarshal(v, &rec); err != nil {
@@ -299,7 +338,7 @@ func (s *Store) AckTraffic(seqs []uint64) error {
 	if len(seqs) == 0 {
 		return nil
 	}
-	return s.db.Update(func(tx *bolt.Tx) error {
+	return s.update(func(tx *bolt.Tx) error {
 		b := tx.Bucket(bucketTraffic)
 		for _, seq := range seqs {
 			var key [8]byte
@@ -315,8 +354,12 @@ func (s *Store) AckTraffic(seqs []uint64) error {
 // PendingBytes returns the number of unacknowledged traffic bytes.
 func (s *Store) PendingBytes() (int64, error) {
 	var total int64
-	err := s.db.View(func(tx *bolt.Tx) error {
-		return tx.Bucket(bucketTraffic).ForEach(func(_, v []byte) error {
+	err := s.view(func(tx *bolt.Tx) error {
+		b := tx.Bucket(bucketTraffic)
+		if b == nil {
+			return nil
+		}
+		return b.ForEach(func(_, v []byte) error {
 			var rec TrafficRecord
 			if err := json.Unmarshal(v, &rec); err != nil {
 				return err
@@ -331,8 +374,10 @@ func (s *Store) PendingBytes() (int64, error) {
 // PendingCount returns the number of journal records.
 func (s *Store) PendingCount() (int, error) {
 	n := 0
-	err := s.db.View(func(tx *bolt.Tx) error {
-		n = tx.Bucket(bucketTraffic).Stats().KeyN
+	err := s.view(func(tx *bolt.Tx) error {
+		if b := tx.Bucket(bucketTraffic); b != nil {
+			n = b.Stats().KeyN
+		}
 		return nil
 	})
 	return n, err
@@ -341,8 +386,10 @@ func (s *Store) PendingCount() (int, error) {
 // PendingAuditCount returns the number of queued audit events.
 func (s *Store) PendingAuditCount() (int, error) {
 	n := 0
-	err := s.db.View(func(tx *bolt.Tx) error {
-		n = tx.Bucket(bucketAudit).Stats().KeyN
+	err := s.view(func(tx *bolt.Tx) error {
+		if b := tx.Bucket(bucketAudit); b != nil {
+			n = b.Stats().KeyN
+		}
 		return nil
 	})
 	return n, err
@@ -354,7 +401,7 @@ func (s *Store) AppendAudit(events []AuditRecord) ([]uint64, error) {
 		return nil, nil
 	}
 	var seqs []uint64
-	err := s.db.Update(func(tx *bolt.Tx) error {
+	err := s.update(func(tx *bolt.Tx) error {
 		meta := tx.Bucket(bucketAuditMeta)
 		next := uint64(1)
 		if v := meta.Get(keyNextAuditSeq); len(v) == 8 {
@@ -394,8 +441,12 @@ func (s *Store) PendingAudit(limit int) ([]AuditRecord, error) {
 		limit = 500
 	}
 	var out []AuditRecord
-	err := s.db.View(func(tx *bolt.Tx) error {
-		c := tx.Bucket(bucketAudit).Cursor()
+	err := s.view(func(tx *bolt.Tx) error {
+		b := tx.Bucket(bucketAudit)
+		if b == nil {
+			return nil
+		}
+		c := b.Cursor()
 		for k, v := c.First(); k != nil && len(out) < limit; k, v = c.Next() {
 			var rec AuditRecord
 			if err := json.Unmarshal(v, &rec); err != nil {
@@ -413,7 +464,7 @@ func (s *Store) AckAudit(seqs []uint64) error {
 	if len(seqs) == 0 {
 		return nil
 	}
-	return s.db.Update(func(tx *bolt.Tx) error {
+	return s.update(func(tx *bolt.Tx) error {
 		b := tx.Bucket(bucketAudit)
 		for _, seq := range seqs {
 			var key [8]byte
@@ -433,8 +484,12 @@ func (s *Store) AuditDedupeSeen(userID, ruleID int64, ttl time.Duration) (bool, 
 	}
 	key := auditKey(userID, ruleID)
 	found := false
-	err := s.db.View(func(tx *bolt.Tx) error {
-		v := tx.Bucket(bucketAuditDedup).Get([]byte(key))
+	err := s.view(func(tx *bolt.Tx) error {
+		b := tx.Bucket(bucketAuditDedup)
+		if b == nil {
+			return nil
+		}
+		v := b.Get([]byte(key))
 		if len(v) != 8 {
 			return nil
 		}
@@ -450,7 +505,7 @@ func (s *Store) MarkAuditDedupe(userID, ruleID int64) error {
 	key := auditKey(userID, ruleID)
 	var v [8]byte
 	binary.BigEndian.PutUint64(v[:], uint64(time.Now().Unix()))
-	return s.db.Update(func(tx *bolt.Tx) error {
+	return s.update(func(tx *bolt.Tx) error {
 		return tx.Bucket(bucketAuditDedup).Put([]byte(key), v[:])
 	})
 }
@@ -461,7 +516,7 @@ func (s *Store) PruneAuditDedupe(ttl time.Duration) error {
 		return nil
 	}
 	cutoff := time.Now().Add(-ttl).Unix()
-	return s.db.Update(func(tx *bolt.Tx) error {
+	return s.update(func(tx *bolt.Tx) error {
 		b := tx.Bucket(bucketAuditDedup)
 		var del [][]byte
 		_ = b.ForEach(func(k, v []byte) error {

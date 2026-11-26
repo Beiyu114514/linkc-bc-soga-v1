@@ -12,24 +12,44 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: release-${{ inputs.tag || github.ref }}
+  cancel-in-progress: false
+
 jobs:
   artifacts:
     runs-on: ubuntu-latest
     steps:
+      - name: Validate dispatch tag
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          if ! [[ "$INPUT_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "Invalid tag format: $INPUT_TAG" >&2
+            exit 1
+          fi
+
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0
           ref: ${{ inputs.tag || github.ref }}
+
+      - name: Verify tag ref
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+        run: git rev-parse -q --verify "refs/tags/${INPUT_TAG}" >/dev/null
 
       - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
           cache: true
 
-      - name: Gate (vet + test)
+      - name: Gate (vet + race test)
         run: |
           go vet ./...
-          go test ./... -count=1
+          go test -race ./... -count=1
 
       - name: Install nfpm
         run: |
@@ -37,9 +57,13 @@ jobs:
           # Prebuilt binary: nfpm v2.49 needs Go >= 1.27.4 to build, and CI
           # pins the toolchain from go.mod (GOTOOLCHAIN=local).
           version=2.49.0
+          sha256="2afaa5ffb5e3493402e31e7c67a5a1fb42133e3f66fc315ca0051934125561c7"
           mkdir -p "$RUNNER_TEMP/bin"
-          curl -sSfL "https://github.com/goreleaser/nfpm/releases/download/v${version}/nfpm_${version}_Linux_x86_64.tar.gz" \
-            | tar -xz -C "$RUNNER_TEMP/bin" nfpm
+          tgz="$RUNNER_TEMP/nfpm.tar.gz"
+          curl -sSfL "https://github.com/goreleaser/nfpm/releases/download/v${version}/nfpm_${version}_Linux_x86_64.tar.gz" -o "$tgz"
+          printf '%s  %s\n' "$sha256" "$tgz" | sha256sum -c -
+          tar -xz -C "$RUNNER_TEMP/bin" -f "$tgz" nfpm
+          rm -f "$tgz"
           echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
           "$RUNNER_TEMP/bin/nfpm" --version
 
@@ -68,15 +92,19 @@ jobs:
           version="${TAG#v}"
           notes="docs/release-notes-${version}.md"
           assets=(dist/*.deb dist/*.rpm dist/linkc-node-linux-* dist/SHA256SUMS)
+          prerelease_flag=()
+          if [[ "$TAG" == *-* ]]; then
+            prerelease_flag=(--prerelease)
+          fi
           if gh release view "$TAG" >/dev/null 2>&1; then
             gh release upload "$TAG" "${assets[@]}" --clobber
             if [ -f "$notes" ]; then
-              gh release edit "$TAG" --title "linkc-node $version" --notes-file "$notes"
+              gh release edit "$TAG" --title "linkc-node $version" "${prerelease_flag[@]}" --notes-file "$notes"
             else
-              gh release edit "$TAG" --title "linkc-node $version"
+              gh release edit "$TAG" --title "linkc-node $version" "${prerelease_flag[@]}"
             fi
           elif [ -f "$notes" ]; then
-            gh release create "$TAG" "${assets[@]}" --title "linkc-node $version" --notes-file "$notes"
+            gh release create "$TAG" "${assets[@]}" --title "linkc-node $version" "${prerelease_flag[@]}" --notes-file "$notes"
           else
-            gh release create "$TAG" "${assets[@]}" --title "linkc-node $version" --generate-notes
+            gh release create "$TAG" "${assets[@]}" --title "linkc-node $version" "${prerelease_flag[@]}" --generate-notes
           fi

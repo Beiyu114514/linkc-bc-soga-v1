@@ -10,6 +10,7 @@ Type=simple
 User=linkc
 Group=linkc
 ExecStart=/usr/local/bin/linkc-node run -c /etc/linkc-node/config.yaml
+ExecReload=/bin/kill -HUP $MAINPID
 Restart=on-failure
 RestartSec=3
 LimitNOFILE=1048576

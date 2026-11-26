@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net"
 	"net/netip"
 	"strconv"
 	"strings"
@@ -124,6 +125,7 @@ type Engine struct {
 	flow       string
 	port       int
 	users      map[int64]User
+	retired    map[int64]struct{}
 	gate       *Gate
 	inboundMgr inbound.Manager
 }
@@ -155,11 +157,9 @@ func Start(ctx context.Context, node NodeConfig, users []User) (*Engine, error) 
 	if err != nil {
 		return nil, fmt.Errorf("create xray instance: %w", err)
 	}
-	if err := inst.Start(); err != nil {
-		_ = inst.Close()
-		return nil, fmt.Errorf("start xray: %w", err)
-	}
 
+	// Wrap the "direct" outbound before starting Xray so the inbound listener
+	// never accepts connections during an unwrapped Gatekeeper window.
 	ihm := inst.GetFeature(inbound.ManagerType()).(inbound.Manager)
 	gate := NewGate(node, users)
 	ohm := inst.GetFeature(outbound.ManagerType()).(outbound.Manager)
@@ -178,6 +178,11 @@ func Start(ctx context.Context, node NodeConfig, users []User) (*Engine, error) 
 		return nil, fmt.Errorf("inject gatekeeper: %w", err)
 	}
 
+	if err := inst.Start(); err != nil {
+		_ = inst.Close()
+		return nil, fmt.Errorf("start xray: %w", err)
+	}
+
 	e := &Engine{
 		inst:       inst,
 		tag:        tag,
@@ -185,6 +190,7 @@ func Start(ctx context.Context, node NodeConfig, users []User) (*Engine, error) 
 		flow:       node.Flow,
 		port:       node.Port,
 		users:      make(map[int64]User, len(users)),
+		retired:    make(map[int64]struct{}),
 		gate:       gate,
 		inboundMgr: ihm,
 	}
@@ -221,6 +227,8 @@ func (e *Engine) ApplyUsers(ctx context.Context, users []User) error {
 	if err := ValidateUsers(users); err != nil {
 		return err
 	}
+	e.swapMu.Lock()
+	defer e.swapMu.Unlock()
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
@@ -244,9 +252,18 @@ func (e *Engine) ApplyUsers(ctx context.Context, users []User) error {
 				}
 			}
 		}
+		if !ok {
+			if e.retired == nil {
+				e.retired = make(map[int64]struct{})
+			}
+			e.retired[id] = struct{}{}
+		}
 	}
 	// Add new/changed users.
 	for id, nu := range next {
+		if e.retired != nil {
+			delete(e.retired, id)
+		}
 		old, ok := e.users[id]
 		if ok && old.UUID == nu.UUID {
 			continue
@@ -405,10 +422,23 @@ func (e *Engine) commit(node NodeConfig, users []User, tag string) {
 	e.flow = node.Flow
 	e.port = node.Port
 	e.nodeCfg = node
-	e.users = make(map[int64]User, len(users))
+	next := make(map[int64]User, len(users))
 	for _, u := range users {
-		e.users[u.ID] = u
+		next[u.ID] = u
+		if e.retired != nil {
+			delete(e.retired, u.ID)
+		}
 	}
+	for id := range e.users {
+		if _, ok := next[id]; !ok {
+			if e.retired == nil {
+				e.retired = make(map[int64]struct{})
+			}
+			e.retired[id] = struct{}{}
+		}
+	}
+	e.users = next
+	e.gate.SetAllowPrivate(node.AllowPrivate)
 	e.gate.UpdateLimitsMap(users)
 }
 
@@ -428,27 +458,59 @@ func (e *Engine) RemoveInbound(ctx context.Context, tag string) error {
 	return e.inboundMgr.RemoveHandler(ctx, tag)
 }
 
-// ReadTraffic atomically reads and resets all user traffic counters.
+// ReadTraffic atomically reads and resets all user traffic counters,
+// including recently removed users whose final bytes have not yet been drained.
 func (e *Engine) ReadTraffic() map[int64]Traffic {
 	sm := e.inst.GetFeature(stats.ManagerType()).(stats.Manager)
 	out := make(map[int64]Traffic)
 	e.mu.Lock()
-	users := make([]User, 0, len(e.users))
-	for _, u := range e.users {
-		users = append(users, u)
+	active := make([]int64, 0, len(e.users))
+	for id := range e.users {
+		active = append(active, id)
+	}
+	retired := make([]int64, 0, len(e.retired))
+	for id := range e.retired {
+		if _, ok := e.users[id]; !ok {
+			retired = append(retired, id)
+		}
 	}
 	e.mu.Unlock()
-	for _, u := range users {
+
+	readUser := func(id int64) Traffic {
 		var t Traffic
-		if c := sm.GetCounter(counterName(u.ID, "uplink")); c != nil {
+		if c := sm.GetCounter(counterName(id, "uplink")); c != nil {
 			t.Up = c.Set(0)
 		}
-		if c := sm.GetCounter(counterName(u.ID, "downlink")); c != nil {
+		if c := sm.GetCounter(counterName(id, "downlink")); c != nil {
 			t.Down = c.Set(0)
 		}
 		if t.Up != 0 || t.Down != 0 {
-			out[u.ID] = t
+			out[id] = t
 		}
+		return t
+	}
+	for _, id := range active {
+		readUser(id)
+	}
+	var doneRetired []int64
+	for _, id := range retired {
+		t := readUser(id)
+		if t.Up == 0 && t.Down == 0 {
+			if e.gate == nil {
+				doneRetired = append(doneRetired, id)
+			} else if tcp, _ := e.gate.Stats(id); tcp == 0 {
+				doneRetired = append(doneRetired, id)
+			}
+		}
+	}
+	if len(doneRetired) > 0 {
+		e.mu.Lock()
+		for _, id := range doneRetired {
+			if _, ok := e.users[id]; !ok {
+				delete(e.retired, id)
+			}
+		}
+		e.mu.Unlock()
 	}
 	return out
 }
@@ -558,7 +620,7 @@ func BuildConfig(node NodeConfig, users []User, tag string) (string, error) {
 		"sniffing": map[string]any{
 			"enabled":      node.Sniffing,
 			"destOverride": []string{"http", "tls", "quic"},
-			"routeOnly":    false,
+			"routeOnly":    true,
 		},
 	}
 
@@ -610,8 +672,23 @@ func freedomSettings(allowPrivate bool) map[string]any {
 			"network": "tcp,udp",
 			"ip": []string{
 				"10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16",
-				"127.0.0.0/8", "169.254.0.0/16",
+				"127.0.0.0/8", "169.254.0.0/16", "100.64.0.0/10", "0.0.0.0/8",
 				"::1/128", "fc00::/7", "fe80::/10",
+			},
+		}}
+	} else {
+		settings["finalRules"] = []any{map[string]any{
+			"action":   "block",
+			"network":  "tcp,udp",
+			"delay":    "0",
+			"logLevel": "warning",
+			"ip": []string{
+				"0.0.0.0/8", "10.0.0.0/8", "100.64.0.0/10", "127.0.0.0/8",
+				"169.254.0.0/16", "172.16.0.0/12", "192.0.0.0/29", "192.0.2.0/24",
+				"192.168.0.0/16", "198.18.0.0/15", "198.51.100.0/24", "203.0.113.0/24",
+				"224.0.0.0/4", "240.0.0.0/4",
+				"::/128", "::1/128", "64:ff9b::/96", "100::/64", "2001:db8::/32",
+				"fc00::/7", "fe80::/10", "ff00::/8",
 			},
 		}}
 	}
@@ -720,6 +797,7 @@ func buildStream(node NodeConfig) (map[string]any, error) {
 			tls["certificates"] = []any{map[string]any{
 				"certificateFile": node.CertFile,
 				"keyFile":         node.KeyFile,
+				"oneTimeLoading":  true,
 			}}
 		}
 		if len(node.ALPN) > 0 {
@@ -808,16 +886,25 @@ type Gate struct {
 	limits       map[int64]User
 	activeTCP    map[int64]int
 	deviceRefs   map[int64]map[string]int
+	tracked      map[*transport.Link]connTrack
 	limiters     map[int64]*rate.Limiter
 	nodeLimiter  *rate.Limiter
 	nodeSpeed    float64
 	mode         string
 	burst        int
 	devicePrefix int
+	allowPrivate bool
 	audit        AuditChecker
+	lookupIP     func(ctx context.Context, network, host string) ([]net.IP, error)
 
 	rejectsTCP    uint64
 	rejectsDevice uint64
+}
+
+type connTrack struct {
+	userID  int64
+	network string
+	device  string
 }
 
 // GateMetrics is a snapshot of aggregate gatekeeper state.
@@ -835,17 +922,24 @@ func NewGate(node NodeConfig, users []User) *Gate {
 		limits:       make(map[int64]User),
 		activeTCP:    make(map[int64]int),
 		deviceRefs:   make(map[int64]map[string]int),
+		tracked:      make(map[*transport.Link]connTrack),
 		limiters:     make(map[int64]*rate.Limiter),
 		nodeSpeed:    node.SpeedLimit,
 		mode:         strings.ToLower(node.LimitsMode),
 		burst:        node.BurstBytes,
 		devicePrefix: node.DeviceIPv6Prefix,
+		allowPrivate: node.AllowPrivate,
 		audit:        node.Audit,
+		lookupIP:     net.DefaultResolver.LookupIP,
 	}
 	if g.mode == "" {
 		g.mode = "enforce"
 	}
-	g.nodeLimiter = makeLimiter(g.nodeSpeed, g.burst)
+	if g.nodeSpeed > 0 {
+		g.nodeLimiter = makeLimiter(g.nodeSpeed, g.burst)
+	} else {
+		g.nodeLimiter = rate.NewLimiter(rate.Inf, 65536)
+	}
 	if g.devicePrefix <= 0 || g.devicePrefix > 128 {
 		g.devicePrefix = 128
 	}
@@ -853,15 +947,20 @@ func NewGate(node NodeConfig, users []User) *Gate {
 	return g
 }
 
-func makeLimiter(mbps float64, burst int) *rate.Limiter {
-	if mbps <= 0 {
-		return nil
-	}
+func rateParams(mbps float64, burst int) (rate.Limit, int) {
 	bytesPerSec := mbps * 1_000_000 / 8
 	if burst <= 0 {
 		burst = 65536
 	}
-	return rate.NewLimiter(rate.Limit(bytesPerSec), int(bytesPerSec*0.2)+burst)
+	return rate.Limit(bytesPerSec), int(bytesPerSec*0.2) + burst
+}
+
+func makeLimiter(mbps float64, burst int) *rate.Limiter {
+	if mbps <= 0 {
+		return nil
+	}
+	lim, b := rateParams(mbps, burst)
+	return rate.NewLimiter(lim, b)
 }
 
 func (g *Gate) UpdateLimits(users map[int64]User) {
@@ -871,13 +970,7 @@ func (g *Gate) UpdateLimits(users map[int64]User) {
 	for _, u := range users {
 		next[u.ID] = u
 	}
-	for id := range g.limiters {
-		old, ok := g.limits[id]
-		nu, still := next[id]
-		if !ok || !still || old.SpeedLimit != nu.SpeedLimit {
-			delete(g.limiters, id)
-		}
-	}
+	g.reconcileLimitersLocked(next)
 	g.limits = next
 }
 
@@ -888,14 +981,32 @@ func (g *Gate) UpdateLimitsMap(users []User) {
 	for _, u := range users {
 		next[u.ID] = u
 	}
-	for id := range g.limiters {
+	g.reconcileLimitersLocked(next)
+	g.limits = next
+}
+
+func (g *Gate) reconcileLimitersLocked(next map[int64]User) {
+	for id, lim := range g.limiters {
 		old, ok := g.limits[id]
 		nu, still := next[id]
-		if !ok || !still || old.SpeedLimit != nu.SpeedLimit {
+		if !still || nu.SpeedLimit <= 0 {
+			// Unthrottle any active connections that still hold this limiter.
+			lim.SetLimit(rate.Inf)
 			delete(g.limiters, id)
+			continue
+		}
+		if !ok || old.SpeedLimit != nu.SpeedLimit {
+			r, b := rateParams(nu.SpeedLimit, g.burst)
+			lim.SetLimit(r)
+			lim.SetBurst(b)
 		}
 	}
-	g.limits = next
+}
+
+func (g *Gate) SetAllowPrivate(allow bool) {
+	g.mu.Lock()
+	g.allowPrivate = allow
+	g.mu.Unlock()
 }
 
 func (g *Gate) Before(ctx context.Context, link *transport.Link) bool {
@@ -912,11 +1023,13 @@ func (g *Gate) Before(ctx context.Context, link *transport.Link) bool {
 	if in.Source.IsValid() && in.Source.Address != nil {
 		src = in.Source.Address.String()
 	}
-	// Audit is independent of the limits mode and runs on the sniffed target.
+	// Audit is independent of the limits mode and runs on both the dialed
+	// target and any sniffed route target.
 	if g.audit != nil {
-		dest := targetDestination(ctx)
-		if dest.IsValid() && g.audit.Check(ctx, id, dest) {
-			return false
+		for _, dest := range targetDestinations(ctx) {
+			if dest.IsValid() && g.audit.Check(ctx, id, dest) {
+				return false
+			}
 		}
 	}
 
@@ -931,12 +1044,12 @@ func (g *Gate) Before(ctx context.Context, link *transport.Link) bool {
 		g.mu.Unlock()
 		return false
 	}
+	var tr connTrack
+	tr.userID = id
 	device := deviceKey(src, g.devicePrefix)
 	if u.DeviceLimit > 0 && device != "" {
-		// Track devices in every non-off mode: After() already decrements
-		// unconditionally, and gating the bookkeeping on enforce left the
-		// device metrics at zero in report mode, which made the mode useless
-		// for evaluating a limit before enabling it.
+		// Track devices in every non-off mode: After() only decrements keys
+		// recorded in tr so a 0 -> >0 DeviceLimit change cannot underflow.
 		set := g.deviceRefs[id]
 		if set == nil {
 			set = make(map[string]int)
@@ -948,9 +1061,17 @@ func (g *Gate) Before(ctx context.Context, link *transport.Link) bool {
 			return false
 		}
 		set[device]++
+		tr.device = device
 	}
 	if network == "tcp" {
 		g.activeTCP[id]++
+		tr.network = "tcp"
+	}
+	if link != nil && (tr.device != "" || tr.network != "") {
+		if g.tracked == nil {
+			g.tracked = make(map[*transport.Link]connTrack)
+		}
+		g.tracked[link] = tr
 	}
 	var lims []*rate.Limiter
 	if g.mode == "enforce" {
@@ -966,7 +1087,7 @@ func (g *Gate) Before(ctx context.Context, link *transport.Link) bool {
 				lims = append(lims, lim)
 			}
 		}
-		if g.nodeLimiter != nil {
+		if g.nodeSpeed > 0 && g.nodeLimiter != nil {
 			lims = append(lims, g.nodeLimiter)
 		}
 	}
@@ -983,38 +1104,44 @@ func (g *Gate) Before(ctx context.Context, link *transport.Link) bool {
 }
 
 func (g *Gate) After(ctx context.Context, link *transport.Link) {
-	if g.mode == "off" {
-		return
-	}
-	in := session.InboundFromContext(ctx)
-	if in == nil || in.User == nil {
-		return
-	}
-	id := userID(in.User.Email)
-	if id == 0 {
-		return
-	}
-	network := targetNetwork(ctx)
-	src := ""
-	if in.Source.IsValid() && in.Source.Address != nil {
-		src = in.Source.Address.String()
-	}
-	device := deviceKey(src, g.devicePrefix)
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	if network == "tcp" && g.activeTCP[id] > 0 {
-		g.activeTCP[id]--
-	}
-	if device != "" {
-		if set := g.deviceRefs[id]; set != nil {
-			if set[device] > 0 {
-				set[device]--
+	var tr connTrack
+	var tracked bool
+	if link != nil {
+		tr, tracked = g.tracked[link]
+		if tracked {
+			delete(g.tracked, link)
+		}
+	} else if g.mode != "off" {
+		in := session.InboundFromContext(ctx)
+		if in != nil && in.User != nil {
+			if id := userID(in.User.Email); id != 0 {
+				tracked = true
+				tr.userID = id
+				tr.network = targetNetwork(ctx)
+				if in.Source.IsValid() && in.Source.Address != nil {
+					tr.device = deviceKey(in.Source.Address.String(), g.devicePrefix)
+				}
 			}
-			if set[device] == 0 {
-				delete(set, device)
+		}
+	}
+	if !tracked {
+		return
+	}
+	if tr.network == "tcp" && g.activeTCP[tr.userID] > 0 {
+		g.activeTCP[tr.userID]--
+	}
+	if tr.device != "" {
+		if set := g.deviceRefs[tr.userID]; set != nil {
+			if set[tr.device] > 0 {
+				set[tr.device]--
+			}
+			if set[tr.device] == 0 {
+				delete(set, tr.device)
 			}
 			if len(set) == 0 {
-				delete(g.deviceRefs, id)
+				delete(g.deviceRefs, tr.userID)
 			}
 		}
 	}
@@ -1023,7 +1150,19 @@ func (g *Gate) After(ctx context.Context, link *transport.Link) {
 func (g *Gate) SetNodeSpeed(mbps float64) {
 	g.mu.Lock()
 	g.nodeSpeed = mbps
-	g.nodeLimiter = makeLimiter(mbps, g.burst)
+	if g.nodeLimiter == nil {
+		if mbps > 0 {
+			g.nodeLimiter = makeLimiter(mbps, g.burst)
+		} else {
+			g.nodeLimiter = rate.NewLimiter(rate.Inf, 65536)
+		}
+	} else if mbps <= 0 {
+		g.nodeLimiter.SetLimit(rate.Inf)
+	} else {
+		r, b := rateParams(mbps, g.burst)
+		g.nodeLimiter.SetLimit(r)
+		g.nodeLimiter.SetBurst(b)
+	}
 	// Existing user limiters are independent of the node cap.
 	g.mu.Unlock()
 }
@@ -1064,16 +1203,19 @@ func deviceKey(src string, prefix int) string {
 	return netip.PrefixFrom(addr, prefix).Masked().String()
 }
 
-func targetDestination(ctx context.Context) xnet.Destination {
+func targetDestinations(ctx context.Context) []xnet.Destination {
 	obs := session.OutboundsFromContext(ctx)
 	if len(obs) == 0 {
-		return xnet.Destination{}
+		return nil
 	}
 	ob := obs[len(obs)-1]
 	if ob == nil {
-		return xnet.Destination{}
+		return nil
 	}
-	return ob.Target
+	if ob.RouteTarget.IsValid() && ob.RouteTarget != ob.Target {
+		return []xnet.Destination{ob.RouteTarget, ob.Target}
+	}
+	return []xnet.Destination{ob.Target}
 }
 
 func targetNetwork(ctx context.Context) string {
@@ -1107,7 +1249,7 @@ type wrapHandler struct {
 	gate *Gate
 }
 
-func (w *wrapHandler) Start() error { return nil }
+func (w *wrapHandler) Start() error { return w.Handler.Start() }
 func (w *wrapHandler) Close() error { return w.Handler.Close() }
 func (w *wrapHandler) Dispatch(ctx context.Context, link *transport.Link) {
 	if w.gate != nil && !w.gate.Before(ctx, link) {
@@ -1117,8 +1259,100 @@ func (w *wrapHandler) Dispatch(ctx context.Context, link *transport.Link) {
 	}
 	if w.gate != nil {
 		defer w.gate.After(ctx, link)
+		if !resolveAndPinTarget(ctx, w.gate) {
+			common.Interrupt(link.Writer)
+			common.Interrupt(link.Reader)
+			return
+		}
 	}
 	w.Handler.Dispatch(ctx, link)
+}
+
+func resolveAndPinTarget(ctx context.Context, g *Gate) bool {
+	g.mu.Lock()
+	allowPrivate := g.allowPrivate
+	lookup := g.lookupIP
+	g.mu.Unlock()
+	if allowPrivate {
+		return true
+	}
+	obs := session.OutboundsFromContext(ctx)
+	if len(obs) == 0 {
+		return true
+	}
+	ob := obs[len(obs)-1]
+	if ob == nil || !ob.Target.IsValid() {
+		return false
+	}
+	if !ob.Target.Address.Family().IsDomain() {
+		return !isBlockedTargetIP(ob.Target.Address.IP())
+	}
+	host := ob.Target.Address.Domain()
+	if ip := net.ParseIP(strings.Trim(strings.TrimSpace(host), "[]")); ip != nil {
+		if isBlockedTargetIP(ip) {
+			return false
+		}
+		ob.Target.Address = xnet.IPAddress(ip)
+		return true
+	}
+	if lookup == nil {
+		lookup = net.DefaultResolver.LookupIP
+	}
+	rctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	ips, err := lookup(rctx, "ip", host)
+	if err != nil || len(ips) == 0 {
+		return false
+	}
+	var chosen net.IP
+	for _, ip := range ips {
+		if isBlockedTargetIP(ip) {
+			return false
+		}
+		if chosen == nil || (chosen.To4() == nil && ip.To4() != nil) {
+			chosen = ip
+		}
+	}
+	if chosen == nil {
+		return false
+	}
+	ob.Target.Address = xnet.IPAddress(chosen)
+	return true
+}
+
+var extraBlockedPrefixes = func() []netip.Prefix {
+	cidrs := []string{
+		"0.0.0.0/8", "100.64.0.0/10", "192.0.0.0/24", "192.0.2.0/24",
+		"198.18.0.0/15", "198.51.100.0/24", "203.0.113.0/24", "240.0.0.0/4",
+		"64:ff9b::/96", "100::/64", "2001:db8::/32",
+	}
+	out := make([]netip.Prefix, 0, len(cidrs))
+	for _, s := range cidrs {
+		out = append(out, netip.MustParsePrefix(s))
+	}
+	return out
+}()
+
+func isBlockedTargetIP(ip net.IP) bool {
+	if ip == nil {
+		return true
+	}
+	addr, ok := netip.AddrFromSlice(ip)
+	if !ok {
+		return true
+	}
+	addr = addr.Unmap()
+	if !addr.IsValid() || addr.IsLoopback() || addr.IsPrivate() ||
+		addr.IsLinkLocalUnicast() || addr.IsLinkLocalMulticast() ||
+		addr.IsMulticast() || addr.IsUnspecified() {
+		return true
+	}
+	for _, p := range extraBlockedPrefixes {
+		if p.Contains(addr) {
+			return true
+		}
+	}
+	return false
 }
 
 type rateReader struct {
@@ -1141,6 +1375,9 @@ func (r *rateReader) ReadMultiBuffer() (buf.MultiBuffer, error) {
 	return mb, nil
 }
 
+func (r *rateReader) Close() error { return common.Close(r.r) }
+func (r *rateReader) Interrupt()   { _ = common.Interrupt(r.r) }
+
 type rateWriter struct {
 	w    buf.Writer
 	lims []*rate.Limiter
@@ -1159,6 +1396,9 @@ func (w *rateWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
 	}
 	return w.w.WriteMultiBuffer(mb)
 }
+
+func (w *rateWriter) Close() error { return common.Close(w.w) }
+func (w *rateWriter) Interrupt()   { _ = common.Interrupt(w.w) }
 
 // waitLimits applies every limiter to n bytes. rate.Limiter.WaitN rejects n
 // larger than the burst, so large buffers are consumed in burst-sized chunks.

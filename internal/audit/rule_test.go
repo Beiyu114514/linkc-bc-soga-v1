@@ -339,3 +339,67 @@ func TestGeoDataRetriedAfterFailure(t *testing.T) {
 		t.Fatalf("geoip rule not active: id=%d ok=%v", id, ok)
 	}
 }
+
+func TestCheckMultiIPDoesNotBreakOnFirstAllowedIP(t *testing.T) {
+	st, err := store.Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	c := New(st, Config{Mode: "auto", Action: "block", DedupeTTL: time.Hour, ResolveDomain: true}, nil)
+	c.lookupIP = func(context.Context, string, string) ([]net.IP, error) {
+		return []net.IP{net.ParseIP("198.51.100.1"), net.ParseIP("203.0.113.99")}, nil
+	}
+	if _, err := c.Update([]panel.AuditRule{{ID: 7, Rule: "ip:203.0.113.99/32"}}, []string{"ip:198.51.100.1"}); err != nil {
+		t.Fatal(err)
+	}
+	dest := xnet.TCPDestination(xnet.DomainAddress("dual.example"), 443)
+	if !c.Check(nil, 1, dest) {
+		t.Fatal("blocked second IP must not be bypassed by first whitelisted IP")
+	}
+}
+
+func TestRegexCaseInsensitiveAndGeoSiteAttr(t *testing.T) {
+	dir := t.TempDir()
+	ips, _ := proto.Marshal(&xgeodata.GeoIPList{Entry: []*xgeodata.GeoIP{{
+		Code: "CN",
+		Cidr: []*xgeodata.CIDR{{Ip: []byte{114, 114, 114, 114}, Prefix: 32}},
+	}}})
+	if err := os.WriteFile(filepath.Join(dir, "geoip.dat"), ips, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	sites, _ := proto.Marshal(&xgeodata.GeoSiteList{Entry: []*xgeodata.GeoSite{{
+		Code: "TEST",
+		Domain: []*xgeodata.Domain{
+			{Type: xgeodata.Domain_Full, Value: "cn.example", Attribute: []*xgeodata.Domain_Attribute{{Key: "cn"}}},
+			{Type: xgeodata.Domain_Full, Value: "global.example"},
+		},
+	}}})
+	if err := os.WriteFile(filepath.Join(dir, "geosite.dat"), sites, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	geo, err := LoadGeodata(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r, st, err := Compile([]panel.AuditRule{
+		{ID: 10, Rule: "regexp:SecretPath"},
+		{ID: 11, Rule: "geosite:test@cn"},
+	}, nil, Config{Mode: "auto", Geo: geo})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.Skipped != 0 {
+		t.Fatalf("unexpected skipped rules: %+v", st)
+	}
+	if id, _, ok := r.Match("api.test/secretpath", nil, 443); !ok || id != 10 {
+		t.Fatalf("case-insensitive regex missed: id=%d ok=%v", id, ok)
+	}
+	if id, _, ok := r.Match("cn.example", nil, 443); !ok || id != 11 {
+		t.Fatalf("geosite:test@cn missed cn.example: id=%d ok=%v", id, ok)
+	}
+	if id, _, ok := r.Match("global.example", nil, 443); ok {
+		t.Fatalf("geosite:test@cn must not match entry without @cn attr: id=%d", id)
+	}
+}

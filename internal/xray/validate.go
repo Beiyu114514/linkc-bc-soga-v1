@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"net"
+	"strconv"
 	"strings"
 
 	xnet "github.com/xtls/xray-core/common/net"
@@ -26,7 +27,7 @@ func ValidateConfig(node NodeConfig) error {
 	if listen == "" {
 		listen = "0.0.0.0"
 	}
-	if listen != "localhost" && net.ParseIP(listen) == nil {
+	if net.ParseIP(listen) == nil {
 		return fmt.Errorf("listen address %q is not an IP", node.Listen)
 	}
 	if node.Port < 1 || node.Port > 65535 {
@@ -114,8 +115,9 @@ func ValidateConfig(node NodeConfig) error {
 		if tlsType != "tls" {
 			return fmt.Errorf("ECH server keys require tls_type=tls")
 		}
-		if _, err := base64.StdEncoding.DecodeString(node.ECHServerKeys); err != nil {
-			return fmt.Errorf("invalid ECH server keys base64: %w", err)
+		raw, err := base64.StdEncoding.DecodeString(node.ECHServerKeys)
+		if err != nil || len(raw) == 0 {
+			return fmt.Errorf("invalid ECH server keys base64")
 		}
 	}
 	if node.MLDSA65Seed != "" {
@@ -128,8 +130,8 @@ func ValidateConfig(node NodeConfig) error {
 		}
 	}
 	if dec := strings.TrimSpace(node.Decryption); dec != "" {
-		if len(dec) > 256 || strings.ContainsAny(dec, "\x00\r\n \t") {
-			return fmt.Errorf("invalid VLESS decryption value")
+		if err := validateDecryption(dec); err != nil {
+			return err
 		}
 	}
 	if node.XHTTP != nil {
@@ -202,6 +204,48 @@ func ValidateConfig(node NodeConfig) error {
 		if sn == "" || len(sn) > 253 || strings.ContainsAny(sn, "\x00\r\n") {
 			return fmt.Errorf("invalid server name %q", sn)
 		}
+	}
+	return nil
+}
+
+func validateDecryption(dec string) error {
+	if len(dec) > 8192 || strings.ContainsAny(dec, "\x00\r\n \t") {
+		return fmt.Errorf("invalid VLESS decryption value")
+	}
+	if dec == "none" {
+		return nil
+	}
+	parts := strings.Split(dec, ".")
+	if len(parts) < 4 || parts[0] != "mlkem768x25519plus" {
+		return fmt.Errorf("unsupported VLESS decryption value")
+	}
+	switch parts[1] {
+	case "native", "xorpub", "random":
+	default:
+		return fmt.Errorf("unsupported VLESS decryption mode %q", parts[1])
+	}
+	t := strings.SplitN(strings.TrimSuffix(parts[2], "s"), "-", 2)
+	if _, err := strconv.Atoi(t[0]); err != nil {
+		return fmt.Errorf("invalid VLESS decryption lifetime %q", parts[2])
+	}
+	if len(t) == 2 {
+		if _, err := strconv.Atoi(t[1]); err != nil {
+			return fmt.Errorf("invalid VLESS decryption lifetime %q", parts[2])
+		}
+	}
+	hasKey := false
+	for _, r := range parts[3:] {
+		if len(r) < 20 {
+			continue
+		}
+		b, err := base64.RawURLEncoding.DecodeString(r)
+		if err != nil || (len(b) != 32 && len(b) != 64) {
+			return fmt.Errorf("invalid VLESS decryption key segment")
+		}
+		hasKey = true
+	}
+	if !hasKey {
+		return fmt.Errorf("VLESS decryption contains no key segments")
 	}
 	return nil
 }
