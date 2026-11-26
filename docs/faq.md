@@ -1,5 +1,11 @@
 # FAQ
 
+### quickstart 一键启动后仍显示离线
+
+- 脚本最后一次 `ready`/`status` 的结论比面板显示更早：先看 `sudo linkc-node status -c /etc/linkc-node/config.yaml`；
+- `--wait 0` 会跳过就绪检查，此时服务已启动但脚本不保证可用；
+- 未就绪时脚本会打印 journal 尾部，常见原因是面板不可达、API Key 错误、下发端口被占用。
+
 ### 节点显示离线
 
 - 检查 `node_heartbeat`、本机系统时间和面板 pull 间隔；

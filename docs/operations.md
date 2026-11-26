@@ -21,6 +21,25 @@ sudo ./scripts/install.sh
 
 `scripts/install.sh` 会创建 `linkc` 用户、目录、安装 systemd unit；配置文件不存在时安装示例配置。
 
+## 一键启动
+
+推荐首次部署使用一键启动脚本（生成最小配置、安装 unit、`check`、启动并等就绪）：
+
+```bash
+printf '%s\n' "$PANEL_API_KEY" | sudo ./scripts/quickstart.sh \
+  --panel-url https://panel.example.com --node-id 12 --api-key-stdin
+```
+
+其它子模式：`--mode docker` 转调 `scripts/docker-launch.sh deploy`，`--stage-only` 只写配置，
+`--dry-run` 只预览，`wizard` 为交互向导。脚本是幂等的（已存在的 `config.yaml` 默认保留，`--force` 覆盖）。
+详见 [quickstart.md](./quickstart.md)。
+
+升级时同样执行这条命令即可：不加 `--force` 会保留现有 `config.yaml`，服务会被重启。
+
+`install.sh` 可用 `LINKC_BIN_DIR` / `LINKC_CONF_DIR` / `LINKC_STATE_DIR` / `LINKC_RUN_DIR` /
+`LINKC_UNIT_DIR` 覆盖安装路径，`LINKC_SKIP_EXAMPLE_CONFIG=1` 跳过示例配置，
+`LINKC_SKIP_SYSTEMCTL=1` 跳过 `systemctl`（仅供测试/打包使用）。
+
 ## systemd
 
 手动安装：
@@ -58,7 +77,8 @@ sudo ./scripts/docker-launch.sh logs -f
 ```
 
 `docker-launch.sh` 为纯命令行部署与管理工具（无 Web 页面），会自动生成配置、API Key 文件、可选证书和 `docker-run.sh`。详见
-[docker-launcher.md](./docker-launcher.md)。
+[docker-launcher.md](./docker-launcher.md)。若只想一条命令搞定，可用
+`sudo ./scripts/quickstart.sh --mode docker ...`，它会带上这些参数转调 `deploy`。
 
 手动方式：
 

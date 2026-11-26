@@ -65,9 +65,11 @@ jobs:
         run: python3 -m unittest discover -s scripts -p 'test_*.py' -v
       - name: shell syntax & cli help
         run: |
-          bash -n scripts/docker-launch.sh
+          bash -n scripts/docker-launch.sh scripts/quickstart.sh
           python3 scripts/docker_launcher.py --help >/dev/null
-          sh -n packaging/preinstall.sh packaging/postinstall.sh packaging/preremove.sh packaging/postremove.sh
+          ./scripts/quickstart.sh --help >/dev/null
+          ./scripts/quickstart.sh --dry-run --panel-url https://panel.example.com --node-id 1 --api-key ci-dummy >/dev/null
+          sh -n scripts/install.sh packaging/preinstall.sh packaging/postinstall.sh packaging/preremove.sh packaging/postremove.sh
 
   build:
     runs-on: ubuntu-latest

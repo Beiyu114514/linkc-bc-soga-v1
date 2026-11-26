@@ -8,6 +8,17 @@ cp -a /var/lib/linkc-node/state.db /var/lib/linkc-node/state.db.bak
 cp -a /etc/linkc-node/config.yaml /etc/linkc-node/config.yaml.bak
 ```
 
+## 用一键启动脚本升级
+
+`scripts/quickstart.sh` 也会重装二进制并重启服务；升级时它会保留现有 `config.yaml`（不加
+`--force` 就不会覆盖），只需传 API Key 或确保 `/etc/linkc-node/api-key` 存在：
+
+```bash
+git pull && sudo ./scripts/quickstart.sh --panel-url https://panel.example.com --node-id 12
+```
+
+升级前的 `state.db` 备份仍建议手工执行（脚本不会碰数据库）。
+
 ## 替换二进制
 
 ```bash

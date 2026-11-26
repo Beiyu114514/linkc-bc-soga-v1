@@ -3,6 +3,9 @@
 从零把 `linkc-node` 接到一个 SSPanel-UIM + `SogaController` 站点上，并完成日常运维。
 更细的字段说明见 [configuration.md](./configuration.md)，部署细节见 [operations.md](./operations.md)。
 
+> 只想尽快跑起来：用一键启动脚本 `sudo ./scripts/quickstart.sh wizard`，
+> 它会完成第 2–4 节的大部分步骤，详见 [quickstart.md](./quickstart.md)。
+
 ## 1. 前置条件
 
 - 一台 Linux 节点机（amd64 / arm64），能访问面板的 `base_url`；
@@ -13,6 +16,31 @@
 程序内嵌 Xray-core，不需要单独安装或管理 Xray 进程。
 
 ## 2. 安装
+
+### 2.0 一键启动（推荐）
+
+`scripts/quickstart.sh` 把「生成配置 → 本地校验 → 安装 systemd 服务 → 启动 → 等就绪」串成一条命令：
+
+```bash
+# 非交互（API Key 从标准输入，不会出现在 ps 中）
+printf '%s\n' "$PANEL_API_KEY" | sudo ./scripts/quickstart.sh \
+  --panel-url https://panel.example.com \
+  --node-id 12 \
+  --api-key-stdin
+
+# 交互式向导 / 只看要做什么
+sudo ./scripts/quickstart.sh wizard
+./scripts/quickstart.sh --dry-run --panel-url https://panel.example.com --node-id 12 --api-key-env PANEL_API_KEY
+```
+
+它会写入 `/etc/linkc-node/config.yaml`（最小可用配置，0600）与 `/etc/linkc-node/api-key`，
+复用 `scripts/install.sh` 安装 `linkc` 用户、二进制与 unit，`check` 通过后
+`systemctl enable --now linkc-node`，最后轮询 `readyz` 并打印 `status`；未就绪时附带最近日志。
+
+常用开关：`--mode docker`（转调 `scripts/docker-launch.sh deploy`）、`--mode foreground`（前台调试）、
+`--cert-file/--key-file`（TLS 证书对）、`--audit-action block`、`--stage-only`（只生成配置）、
+`--force`（覆盖已有配置）、`--wait SECONDS`（等待就绪的秒数）。完整参数见
+[quickstart.md](./quickstart.md) 与 `./scripts/quickstart.sh --help`。
 
 ### 2.1 二进制 / 安装包
 
@@ -30,6 +58,8 @@ make build
 sudo ./scripts/install.sh
 ```
 
+`scripts/install.sh` 只负责安装，不启动服务；配置需自行准备，然后 `systemctl enable --now linkc-node`。
+
 ### 2.2 Docker
 
 ```bash
@@ -40,6 +70,15 @@ docker run -d --name linkc-node --network host --restart unless-stopped \
 ```
 
 必须用 `--network host`，否则丢失真实源 IP，`alive_ip` 与设备数限制会失真。
+
+也可以用启动器一键生成配置并部署（支持交互向导、证书暂存、备份与回滚）：
+
+```bash
+sudo ./scripts/docker-launch.sh wizard
+# 或 sudo ./scripts/quickstart.sh --mode docker --panel-url https://panel.example.com --node-id 12 --api-key-env PANEL_API_KEY
+```
+
+详见 [docker-launcher.md](./docker-launcher.md)。
 
 ## 3. 配置
 
@@ -237,6 +276,7 @@ sudo systemctl start linkc-node
 
 ## 9. 相关文档
 
+- [quickstart.md](./quickstart.md)：一键启动脚本（`scripts/quickstart.sh`）
 - [configuration.md](./configuration.md)：全部配置字段
 - [operations.md](./operations.md)：部署、Docker、备份、面板故障
 - [monitoring.md](./monitoring.md)：指标、抓取、告警

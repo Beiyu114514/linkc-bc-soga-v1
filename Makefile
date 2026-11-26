@@ -9,7 +9,7 @@ LDFLAGS := -s -w \
   -X github.com/Beiyu114514/linkc-bc-soga-v1/internal/version.Commit=$(COMMIT) \
   -X github.com/Beiyu114514/linkc-bc-soga-v1/internal/version.Date=$(DATE)
 
-.PHONY: all build linux-amd64 linux-arm64 test race vet fmt clean clean-dist package-deb package-rpm release-artifacts soak bench docker-launch test-launcher
+.PHONY: quickstart all build linux-amd64 linux-arm64 test race vet fmt clean clean-dist package-deb package-rpm release-artifacts soak bench docker-launch test-launcher
 
 all: build
 
@@ -68,6 +68,11 @@ bench:
 # Interactive CLI wizard for deploying linkc-node in Docker.
 docker-launch:
 	./scripts/docker-launch.sh wizard
+
+# 一键启动脚本的语法与帮助输出检查（不需要 root / Docker）。
+quickstart:
+	bash -n scripts/quickstart.sh
+	./scripts/quickstart.sh --help >/dev/null
 
 # Unit tests for the Docker launcher (stdlib only; no Docker or root needed).
 test-launcher:

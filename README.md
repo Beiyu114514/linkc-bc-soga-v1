@@ -12,6 +12,7 @@
 ## 文档
 
 - [docs/usage.md](./docs/usage.md)：**使用文档**（安装 → 配置 → 启动验证 → 常用操作 → 排障）
+- [docs/quickstart.md](./docs/quickstart.md)：**一键启动脚本**（`scripts/quickstart.sh`）
 - [PLAN.md](./PLAN.md)：总体技术规划（v0.9）
 - [M0-REPORT.md](./M0-REPORT.md)：技术验证结果
 - [M1-REPORT.md](./M1-REPORT.md)：MVP 实现、测试与遗留
@@ -68,6 +69,31 @@ go build -trimpath -o linkc-node ./cmd/linkc-node
 Xray 版本固定为 release `v26.11.9` 的 commit 伪版本：
 `v1.260327.1-0.20261109052709-676eaf66f8f0`
 （GitHub tag `v26.11.9` 不是合法 Go module semver）。
+
+## 一键启动（推荐）
+
+一条命令完成「生成配置 → 本地校验 → 安装 systemd 服务 → 启动 → 等就绪」：
+
+```bash
+# 非交互（API Key 走标准输入，不进 ps）
+printf '%s\n' "$PANEL_API_KEY" | sudo ./scripts/quickstart.sh \
+  --panel-url https://panel.example.com \
+  --node-id 12 \
+  --api-key-stdin
+
+# 交互式向导
+sudo ./scripts/quickstart.sh wizard
+
+# 只预览，不写文件
+./scripts/quickstart.sh --dry-run --panel-url https://panel.example.com --node-id 12 --api-key-env PANEL_API_KEY
+```
+
+脚本会生成 `/etc/linkc-node/config.yaml`（0600）与 `/etc/linkc-node/api-key`，复用
+`scripts/install.sh` 安装 `linkc` 用户与 systemd unit，`check` 通过后 `systemctl enable --now`，
+最后轮询 `readyz` 并打印 `status`；未就绪时自动附带最近日志。
+
+`--mode docker` 会转调下面的 `scripts/docker-launch.sh deploy`；`--mode foreground` 直接前台运行。
+完整参数见 `./scripts/quickstart.sh --help` 与 [docs/quickstart.md](./docs/quickstart.md)。
 
 ## Docker 一键部署（命令行）
 
