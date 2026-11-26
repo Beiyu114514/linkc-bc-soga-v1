@@ -75,7 +75,7 @@ docker pull ghcr.io/beiyu114514/linkc-bc-soga-v1:0.12.0
 ```
 
 升级前请备份 `/var/lib/linkc-node/state.db` 和现有配置。更完整的回滚步骤见
-[upgrade.md](./upgrade.md)。
+[升级指南](https://github.com/Beiyu114514/linkc-bc-soga-v1/blob/main/docs/upgrade.md)。
 
 ## 发布资产
 
