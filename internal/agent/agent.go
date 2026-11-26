@@ -105,6 +105,10 @@ type Agent struct {
 	// pendingRemove holds inbound tags whose removal failed and must be
 	// retried, otherwise a stale listener could keep serving old users/certs.
 	pendingRemove []string
+
+	// onlineIPsFn and swapInboundFn default to (*xray.Engine) methods; tests can override them.
+	onlineIPsFn   func(*xray.Engine) map[int64][]string
+	swapInboundFn func(*xray.Engine, context.Context, xray.NodeConfig, []xray.User) (xray.SwapReport, error)
 }
 
 // New opens the store and panel client. Run performs the first bootstrap.
@@ -709,8 +713,13 @@ func (a *Agent) shutdown() {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	// Flush online IPs before closing Xray (Close tears down OnlineMaps).
+	var onlineIDs []int64
+	// Flush online IPs (and snapshot online-zero user IDs) before closing
+	// Xray, because Close tears down OnlineMaps.
 	if engine != nil {
+		if a.cfg.Node.Traffic.IncludeOnlineZero {
+			onlineIDs = a.onlineIDsFromEngine(engine)
+		}
 		if err := a.pushAliveWithEngine(ctx, engine); err != nil {
 			a.log.Warn("final alive_ip push", "error", err)
 		}
@@ -721,7 +730,7 @@ func (a *Agent) shutdown() {
 	// Collect and push after engine.Close() so final bytes on closing
 	// connections are included before the process exits.
 	a.collect(ctx)
-	if err := a.Push(ctx); err != nil {
+	if err := a.pushWithOnline(ctx, onlineIDs); err != nil {
 		a.log.Warn("final push", "error", err)
 	}
 }
@@ -845,6 +854,39 @@ func (a *Agent) collect(ctx context.Context) {
 
 // Push sends pending traffic and a status sample.
 func (a *Agent) Push(ctx context.Context) error {
+	var onlineIDs []int64
+	if a.cfg.Node.Traffic.IncludeOnlineZero {
+		a.mu.Lock()
+		engine := a.engine
+		a.mu.Unlock()
+		onlineIDs = a.onlineIDsFromEngine(engine)
+	}
+	return a.pushWithOnline(ctx, onlineIDs)
+}
+
+func (a *Agent) engineOnlineIPs(engine *xray.Engine) map[int64][]string {
+	if engine == nil {
+		return nil
+	}
+	if a.onlineIPsFn != nil {
+		return a.onlineIPsFn(engine)
+	}
+	return engine.OnlineIPs()
+}
+
+func (a *Agent) onlineIDsFromEngine(engine *xray.Engine) []int64 {
+	ips := a.engineOnlineIPs(engine)
+	if len(ips) == 0 {
+		return nil
+	}
+	ids := make([]int64, 0, len(ips))
+	for id := range ips {
+		ids = append(ids, id)
+	}
+	return ids
+}
+
+func (a *Agent) pushWithOnline(ctx context.Context, onlineIDs []int64) error {
 	a.mu.Lock()
 	tm := a.trafficMgr
 	a.mu.Unlock()
@@ -865,31 +907,26 @@ func (a *Agent) Push(ctx context.Context) error {
 			}
 		}
 	}
-	if a.cfg.Node.Traffic.IncludeOnlineZero {
-		a.mu.Lock()
-		engine := a.engine
-		a.mu.Unlock()
-		if engine != nil {
-			var zeros []panel.Traffic
-			for id := range engine.OnlineIPs() {
-				zeros = append(zeros, panel.Traffic{ID: id, U: 0, D: 0})
+	if a.cfg.Node.Traffic.IncludeOnlineZero && len(onlineIDs) > 0 {
+		zeros := make([]panel.Traffic, 0, len(onlineIDs))
+		for _, id := range onlineIDs {
+			zeros = append(zeros, panel.Traffic{ID: id, U: 0, D: 0})
+		}
+		batchUsers := a.cfg.Node.Traffic.BatchUsers
+		if batchUsers <= 0 {
+			batchUsers = 500
+		}
+		for start := 0; start < len(zeros); start += batchUsers {
+			end := start + batchUsers
+			if end > len(zeros) {
+				end = len(zeros)
 			}
-			batchUsers := a.cfg.Node.Traffic.BatchUsers
-			if batchUsers <= 0 {
-				batchUsers = 500
-			}
-			for start := 0; start < len(zeros); start += batchUsers {
-				end := start + batchUsers
-				if end > len(zeros) {
-					end = len(zeros)
+			if err := a.panel.PushTraffic(ctx, zeros[start:end]); err != nil {
+				if firstErr == nil {
+					firstErr = fmt.Errorf("traffic online-zero: %w", err)
 				}
-				if err := a.panel.PushTraffic(ctx, zeros[start:end]); err != nil {
-					if firstErr == nil {
-						firstErr = fmt.Errorf("traffic online-zero: %w", err)
-					}
-					a.setApplyError("traffic", err)
-					break
-				}
+				a.setApplyError("traffic", err)
+				break
 			}
 		}
 	}
@@ -933,10 +970,7 @@ func (a *Agent) OnlineIPs() map[int64][]string {
 	a.mu.Lock()
 	e := a.engine
 	a.mu.Unlock()
-	if e == nil {
-		return nil
-	}
-	return e.OnlineIPs()
+	return a.engineOnlineIPs(e)
 }
 
 func newAuditChecker(st *store.Store, cfg config.Config, log *slog.Logger) *audit.Checker {

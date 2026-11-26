@@ -227,9 +227,15 @@ func TestPostJSONRequiresCodeAndHandlesLarge200(t *testing.T) {
 }
 
 func TestGetRejectsMalformed200JSONBeforeETagCache(t *testing.T) {
+	var fail atomic.Bool
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("ETag", `"bad-etag"`)
-		_, _ = w.Write([]byte(`{not-json`))
+		if fail.Load() {
+			w.Header().Set("ETag", `"bad-etag"`)
+			_, _ = w.Write([]byte(`{not-json`))
+			return
+		}
+		w.Header().Set("ETag", `"good-etag"`)
+		_, _ = w.Write([]byte(`{"code":0,"data":{"type":"vless","basic":{"pull_interval":60,"push_interval":60},"config":{"server_port":443,"network":"tcp","security":"none"}}}`))
 	}))
 	defer srv.Close()
 
@@ -243,10 +249,21 @@ func TestGetRejectsMalformed200JSONBeforeETagCache(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	key := c.cacheKey(pathNode)
+	if _, _, err := c.FetchNode(context.Background()); err != nil {
+		t.Fatalf("valid 200 JSON failed: %v", err)
+	}
+	rec, ok, err := st.GetETag(key)
+	if err != nil || !ok || rec.ETag != `"good-etag"` {
+		t.Fatalf("expected good-etag cached at %q, got ok=%v rec=%+v err=%v", key, ok, rec, err)
+	}
+
+	fail.Store(true)
 	if _, _, err := c.FetchNode(context.Background()); err == nil {
 		t.Fatal("expected error for malformed JSON body")
 	}
-	if _, ok, err := st.GetETag("/api/v1/node_info?node_id=1"); err != nil || ok {
-		t.Fatalf("malformed 200 response must not be cached: ok=%v err=%v", ok, err)
+	rec, ok, err = st.GetETag(key)
+	if err != nil || !ok || rec.ETag != `"good-etag"` {
+		t.Fatalf("malformed 200 response overwrote cached ETag at %q: ok=%v rec=%+v err=%v", key, ok, rec, err)
 	}
 }

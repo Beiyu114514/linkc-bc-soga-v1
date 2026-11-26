@@ -115,6 +115,9 @@ func ValidateConfig(node NodeConfig) error {
 		if tlsType != "tls" {
 			return fmt.Errorf("ECH server keys require tls_type=tls")
 		}
+		if strings.ContainsAny(node.ECHServerKeys, "\x00\r\n \t") {
+			return fmt.Errorf("invalid ECH server keys base64")
+		}
 		raw, err := base64.StdEncoding.DecodeString(node.ECHServerKeys)
 		if err != nil || len(raw) == 0 {
 			return fmt.Errorf("invalid ECH server keys base64")
@@ -224,30 +227,85 @@ func validateDecryption(dec string) error {
 	default:
 		return fmt.Errorf("unsupported VLESS decryption mode %q", parts[1])
 	}
-	t := strings.SplitN(strings.TrimSuffix(parts[2], "s"), "-", 2)
-	if _, err := strconv.Atoi(t[0]); err != nil {
+	if !strings.HasSuffix(parts[2], "s") {
+		return fmt.Errorf("invalid VLESS decryption lifetime %q", parts[2])
+	}
+	t := strings.Split(strings.TrimSuffix(parts[2], "s"), "-")
+	if len(t) > 2 {
+		return fmt.Errorf("invalid VLESS decryption lifetime %q", parts[2])
+	}
+	from, err := parseNonNegInt(t[0])
+	if err != nil {
 		return fmt.Errorf("invalid VLESS decryption lifetime %q", parts[2])
 	}
 	if len(t) == 2 {
-		if _, err := strconv.Atoi(t[1]); err != nil {
+		to, err := parseNonNegInt(t[1])
+		if err != nil || to < from {
 			return fmt.Errorf("invalid VLESS decryption lifetime %q", parts[2])
 		}
 	}
-	hasKey := false
-	for _, r := range parts[3:] {
+	seenKey := false
+	maxPaddingLen := 0
+	for i, r := range parts[3:] {
 		if len(r) < 20 {
+			if seenKey {
+				return fmt.Errorf("invalid VLESS decryption key segment")
+			}
+			if err := validateDecryptionPadding(i, r, &maxPaddingLen); err != nil {
+				return err
+			}
 			continue
 		}
 		b, err := base64.RawURLEncoding.DecodeString(r)
 		if err != nil || (len(b) != 32 && len(b) != 64) {
 			return fmt.Errorf("invalid VLESS decryption key segment")
 		}
-		hasKey = true
+		seenKey = true
 	}
-	if !hasKey {
+	if !seenKey {
 		return fmt.Errorf("VLESS decryption contains no key segments")
 	}
 	return nil
+}
+
+func validateDecryptionPadding(idx int, seg string, maxLen *int) error {
+	x := strings.Split(seg, "-")
+	if len(x) != 3 {
+		return fmt.Errorf("invalid VLESS decryption padding segment %q", seg)
+	}
+	var y [3]int
+	for i := range y {
+		v, err := parseNonNegInt(x[i])
+		if err != nil {
+			return fmt.Errorf("invalid VLESS decryption padding segment %q", seg)
+		}
+		y[i] = v
+	}
+	if y[2] < y[1] {
+		return fmt.Errorf("invalid VLESS decryption padding range %q", seg)
+	}
+	if idx == 0 && (y[0] < 100 || y[1] < 35 || y[2] < 35) {
+		return fmt.Errorf("invalid initial VLESS decryption padding segment %q", seg)
+	}
+	if idx%2 == 0 {
+		*maxLen += y[2]
+		if *maxLen > 18+65535 {
+			return fmt.Errorf("VLESS decryption total padding length exceeds limit")
+		}
+	}
+	return nil
+}
+
+func parseNonNegInt(s string) (int, error) {
+	if s == "" {
+		return 0, fmt.Errorf("empty integer")
+	}
+	for i := 0; i < len(s); i++ {
+		if s[i] < '0' || s[i] > '9' {
+			return 0, fmt.Errorf("non-digit character")
+		}
+	}
+	return strconv.Atoi(s)
 }
 
 // AuditChecker decides whether a connection must be blocked by audit rules.

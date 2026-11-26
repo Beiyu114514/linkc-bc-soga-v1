@@ -24,6 +24,10 @@ import (
 
 	m0engine "github.com/Beiyu114514/linkc-bc-soga-v1/internal/m0/engine"
 	"github.com/Beiyu114514/linkc-bc-soga-v1/internal/xray"
+	xnet "github.com/xtls/xray-core/common/net"
+	"github.com/xtls/xray-core/common/protocol"
+	"github.com/xtls/xray-core/common/session"
+	"github.com/xtls/xray-core/transport"
 	xproxy "golang.org/x/net/proxy"
 )
 
@@ -434,20 +438,29 @@ func TestApplyUsersConcurrentWithSwapInbound(t *testing.T) {
 	defer e.Close()
 
 	var wg sync.WaitGroup
+	errs := make(chan error, 9)
 	wg.Add(2)
 	go func() {
 		defer wg.Done()
 		for i := 0; i < 6; i++ {
-			_ = e.ApplyUsers(ctx, []xray.User{{ID: 1, UUID: testUUID, SpeedLimit: float64(i + 1)}})
+			if err := e.ApplyUsers(ctx, []xray.User{{ID: 1, UUID: testUUID, SpeedLimit: float64(i + 1)}}); err != nil {
+				errs <- fmt.Errorf("ApplyUsers(%d): %w", i, err)
+			}
 		}
 	}()
 	go func() {
 		defer wg.Done()
 		for i := 0; i < 3; i++ {
-			_, _ = e.SwapInbound(ctx, baseNode(freePort(t)), []xray.User{{ID: 1, UUID: testUUID}})
+			if _, err := e.SwapInbound(ctx, baseNode(freePort(t)), []xray.User{{ID: 1, UUID: testUUID}}); err != nil {
+				errs <- fmt.Errorf("SwapInbound(%d): %w", i, err)
+			}
 		}
 	}()
 	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Fatal(err)
+	}
 }
 
 func TestDeviceLimitZeroToPositiveNoUnderflow(t *testing.T) {
@@ -577,5 +590,61 @@ func TestFreedomBlocksPrivateTargetWhenDisabled(t *testing.T) {
 	if resp, err := socksClient(t, socksPort).Get(target.URL); err == nil {
 		resp.Body.Close()
 		t.Fatal("expected loopback target to be blocked when AllowPrivate=false")
+	}
+}
+
+func TestReadTrafficKeepsRetiredUserWithActiveUDPAndOffMode(t *testing.T) {
+	ctx := context.Background()
+	for _, tc := range []struct {
+		name   string
+		mode   string
+		target xnet.Destination
+	}{
+		{
+			name:   "udp_enforce",
+			mode:   "enforce",
+			target: xnet.UDPDestination(xnet.ParseAddress("8.8.8.8"), 53),
+		},
+		{
+			name:   "tcp_off",
+			mode:   "off",
+			target: xnet.TCPDestination(xnet.ParseAddress("1.1.1.1"), 443),
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			n := baseNode(freePort(t))
+			n.LimitsMode = tc.mode
+			e, err := xray.Start(ctx, n, []xray.User{{ID: 1, UUID: testUUID}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer e.Close()
+
+			connCtx := session.ContextWithInbound(ctx, &session.Inbound{
+				User:   &protocol.MemoryUser{Email: "u1"},
+				Source: xnet.TCPDestination(xnet.ParseAddress("1.2.3.4"), 12345),
+			})
+			connCtx = session.ContextWithOutbounds(connCtx, []*session.Outbound{{Target: tc.target}})
+			link := &transport.Link{}
+			if !e.Gate().Before(connCtx, link) {
+				t.Fatal("Gate.Before rejected active connection")
+			}
+
+			// Retire user 1 while session is still active.
+			if err := e.ApplyUsers(ctx, nil); err != nil {
+				t.Fatal(err)
+			}
+			_ = e.ReadTraffic()
+			if got := e.Gate().ActiveConns(1); got != 1 {
+				t.Fatalf("ActiveConns = %d, want 1", got)
+			}
+
+			// Simulate traffic arriving on the still-open session after a zero-delta tick.
+			e.Gate().After(connCtx, link)
+			if got := e.Gate().ActiveConns(1); got != 0 {
+				t.Fatalf("ActiveConns after close = %d, want 0", got)
+			}
+			_ = e.ReadTraffic()
+		})
 	}
 }

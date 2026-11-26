@@ -129,7 +129,13 @@ func (a *Agent) Sync(ctx context.Context) error {
 
 	if nodeCfgChanged {
 		a.collect(ctx)
-		rep, err := engine.SwapInbound(ctx, xc, nextUsers)
+		var rep xray.SwapReport
+		var err error
+		if a.swapInboundFn != nil {
+			rep, err = a.swapInboundFn(engine, ctx, xc, nextUsers)
+		} else {
+			rep, err = engine.SwapInbound(ctx, xc, nextUsers)
+		}
 		if rep.StaleTag != "" {
 			a.log.Error("inbound swap left a stale listener; queued for retry", "tag", rep.StaleTag, "error", err)
 			a.queueRemove(rep.StaleTag)
@@ -139,6 +145,9 @@ func (a *Agent) Sync(ctx context.Context) error {
 			engine.SetNodeSpeed(spec.Basic.SpeedLimit)
 			a.commitNode(spec, xc, nextUsers)
 			usersApplied = true
+			if usersUpdated {
+				a.setApplyError("users", nil)
+			}
 			nodeUpdated = false
 			if err != nil {
 				applyErr = errors.Join(applyErr, fmt.Errorf("swap inbound: %w", err))
@@ -146,9 +155,6 @@ func (a *Agent) Sync(ctx context.Context) error {
 				a.log.Warn("inbound swapped with warning", "warning", rep.Warning, "error", err)
 			} else {
 				a.setApplyError("node", nil)
-				if usersUpdated {
-					a.setApplyError("users", nil)
-				}
 				if rep.Warning != "" {
 					a.log.Warn("inbound swap warning", "warning", rep.Warning)
 				}

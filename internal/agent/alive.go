@@ -95,7 +95,7 @@ func (a *Agent) pushAliveWithEngine(ctx context.Context, engine *xray.Engine) er
 	if engine == nil || tracker == nil {
 		return nil
 	}
-	current := engine.OnlineIPs()
+	current := a.engineOnlineIPs(engine)
 	batch, full := tracker.pending(current)
 	if len(batch) == 0 {
 		// Nothing to send; still apply the snapshot so offline users are

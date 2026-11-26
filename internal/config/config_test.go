@@ -146,3 +146,17 @@ func TestValidateTransportEnums(t *testing.T) {
 		t.Fatal("expected status mode error")
 	}
 }
+
+func TestValidateECHServerKeysRejectsWhitespace(t *testing.T) {
+	for _, raw := range []string{"\n", "\r\n", " \t", "YWI= \n"} {
+		c := Default()
+		c.Panel.BaseURL = "https://example.com"
+		c.Panel.APIKey = "k"
+		c.Panel.NodeID = "1"
+		c.Storage.Path = t.TempDir()
+		c.Node.TLS.ECHServerKeys = raw
+		if err := c.Validate(); err == nil {
+			t.Fatalf("ECHServerKeys=%q must be rejected", raw)
+		}
+	}
+}

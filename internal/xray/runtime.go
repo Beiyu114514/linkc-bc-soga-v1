@@ -498,7 +498,7 @@ func (e *Engine) ReadTraffic() map[int64]Traffic {
 		if t.Up == 0 && t.Down == 0 {
 			if e.gate == nil {
 				doneRetired = append(doneRetired, id)
-			} else if tcp, _ := e.gate.Stats(id); tcp == 0 {
+			} else if e.gate.ActiveConns(id) == 0 {
 				doneRetired = append(doneRetired, id)
 			}
 		}
@@ -684,7 +684,7 @@ func freedomSettings(allowPrivate bool) map[string]any {
 			"logLevel": "warning",
 			"ip": []string{
 				"0.0.0.0/8", "10.0.0.0/8", "100.64.0.0/10", "127.0.0.0/8",
-				"169.254.0.0/16", "172.16.0.0/12", "192.0.0.0/29", "192.0.2.0/24",
+				"169.254.0.0/16", "172.16.0.0/12", "192.0.0.0/24", "192.0.2.0/24",
 				"192.168.0.0/16", "198.18.0.0/15", "198.51.100.0/24", "203.0.113.0/24",
 				"224.0.0.0/4", "240.0.0.0/4",
 				"::/128", "::1/128", "64:ff9b::/96", "100::/64", "2001:db8::/32",
@@ -885,6 +885,7 @@ type Gate struct {
 	mu           sync.Mutex
 	limits       map[int64]User
 	activeTCP    map[int64]int
+	activeConns  map[int64]int
 	deviceRefs   map[int64]map[string]int
 	tracked      map[*transport.Link]connTrack
 	limiters     map[int64]*rate.Limiter
@@ -897,6 +898,10 @@ type Gate struct {
 	audit        AuditChecker
 	lookupIP     func(ctx context.Context, network, host string) ([]net.IP, error)
 
+	resolveMu    sync.Mutex
+	resolveCache map[string]gateResolveEntry
+	resolveFly   map[string]*resolveFlight
+
 	rejectsTCP    uint64
 	rejectsDevice uint64
 }
@@ -905,6 +910,23 @@ type connTrack struct {
 	userID  int64
 	network string
 	device  string
+	active  bool
+}
+
+const (
+	gateResolveTTL      = 30 * time.Second
+	gateResolveNegTTL   = 5 * time.Second
+	gateResolveMaxEntry = 4096
+)
+
+type gateResolveEntry struct {
+	allowed   bool
+	expiresAt time.Time
+}
+
+type resolveFlight struct {
+	done    chan struct{}
+	allowed bool
 }
 
 // GateMetrics is a snapshot of aggregate gatekeeper state.
@@ -921,6 +943,7 @@ func NewGate(node NodeConfig, users []User) *Gate {
 	g := &Gate{
 		limits:       make(map[int64]User),
 		activeTCP:    make(map[int64]int),
+		activeConns:  make(map[int64]int),
 		deviceRefs:   make(map[int64]map[string]int),
 		tracked:      make(map[*transport.Link]connTrack),
 		limiters:     make(map[int64]*rate.Limiter),
@@ -931,6 +954,8 @@ func NewGate(node NodeConfig, users []User) *Gate {
 		allowPrivate: node.AllowPrivate,
 		audit:        node.Audit,
 		lookupIP:     net.DefaultResolver.LookupIP,
+		resolveCache: make(map[string]gateResolveEntry),
+		resolveFly:   make(map[string]*resolveFlight),
 	}
 	if g.mode == "" {
 		g.mode = "enforce"
@@ -1035,6 +1060,16 @@ func (g *Gate) Before(ctx context.Context, link *transport.Link) bool {
 
 	g.mu.Lock()
 	if g.mode == "off" {
+		if g.activeConns == nil {
+			g.activeConns = make(map[int64]int)
+		}
+		g.activeConns[id]++
+		if link != nil {
+			if g.tracked == nil {
+				g.tracked = make(map[*transport.Link]connTrack)
+			}
+			g.tracked[link] = connTrack{userID: id, active: true}
+		}
 		g.mu.Unlock()
 		return true
 	}
@@ -1067,7 +1102,12 @@ func (g *Gate) Before(ctx context.Context, link *transport.Link) bool {
 		g.activeTCP[id]++
 		tr.network = "tcp"
 	}
-	if link != nil && (tr.device != "" || tr.network != "") {
+	if g.activeConns == nil {
+		g.activeConns = make(map[int64]int)
+	}
+	g.activeConns[id]++
+	tr.active = true
+	if link != nil {
 		if g.tracked == nil {
 			g.tracked = make(map[*transport.Link]connTrack)
 		}
@@ -1113,15 +1153,18 @@ func (g *Gate) After(ctx context.Context, link *transport.Link) {
 		if tracked {
 			delete(g.tracked, link)
 		}
-	} else if g.mode != "off" {
+	} else {
 		in := session.InboundFromContext(ctx)
 		if in != nil && in.User != nil {
 			if id := userID(in.User.Email); id != 0 {
 				tracked = true
 				tr.userID = id
-				tr.network = targetNetwork(ctx)
-				if in.Source.IsValid() && in.Source.Address != nil {
-					tr.device = deviceKey(in.Source.Address.String(), g.devicePrefix)
+				tr.active = true
+				if g.mode != "off" {
+					tr.network = targetNetwork(ctx)
+					if in.Source.IsValid() && in.Source.Address != nil {
+						tr.device = deviceKey(in.Source.Address.String(), g.devicePrefix)
+					}
 				}
 			}
 		}
@@ -1129,8 +1172,17 @@ func (g *Gate) After(ctx context.Context, link *transport.Link) {
 	if !tracked {
 		return
 	}
+	if tr.active && g.activeConns[tr.userID] > 0 {
+		g.activeConns[tr.userID]--
+		if g.activeConns[tr.userID] == 0 {
+			delete(g.activeConns, tr.userID)
+		}
+	}
 	if tr.network == "tcp" && g.activeTCP[tr.userID] > 0 {
 		g.activeTCP[tr.userID]--
+		if g.activeTCP[tr.userID] == 0 {
+			delete(g.activeTCP, tr.userID)
+		}
 	}
 	if tr.device != "" {
 		if set := g.deviceRefs[tr.userID]; set != nil {
@@ -1171,6 +1223,14 @@ func (g *Gate) Stats(id int64) (activeTCP int, devices int) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	return g.activeTCP[id], len(g.deviceRefs[id])
+}
+
+// ActiveConns returns the total number of active connections (TCP and UDP, in
+// any limits mode) currently tracked for user id.
+func (g *Gate) ActiveConns(id int64) int {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.activeConns[id]
 }
 
 // Metrics returns aggregate counters for the admin endpoint.
@@ -1259,7 +1319,7 @@ func (w *wrapHandler) Dispatch(ctx context.Context, link *transport.Link) {
 	}
 	if w.gate != nil {
 		defer w.gate.After(ctx, link)
-		if !resolveAndPinTarget(ctx, w.gate) {
+		if !resolveAndCheckTarget(ctx, w.gate) {
 			common.Interrupt(link.Writer)
 			common.Interrupt(link.Reader)
 			return
@@ -1268,7 +1328,7 @@ func (w *wrapHandler) Dispatch(ctx context.Context, link *transport.Link) {
 	w.Handler.Dispatch(ctx, link)
 }
 
-func resolveAndPinTarget(ctx context.Context, g *Gate) bool {
+func resolveAndCheckTarget(ctx context.Context, g *Gate) bool {
 	g.mu.Lock()
 	allowPrivate := g.allowPrivate
 	lookup := g.lookupIP
@@ -1287,37 +1347,88 @@ func resolveAndPinTarget(ctx context.Context, g *Gate) bool {
 	if !ob.Target.Address.Family().IsDomain() {
 		return !isBlockedTargetIP(ob.Target.Address.IP())
 	}
-	host := ob.Target.Address.Domain()
-	if ip := net.ParseIP(strings.Trim(strings.TrimSpace(host), "[]")); ip != nil {
+	host := strings.TrimSpace(ob.Target.Address.Domain())
+	if ip := net.ParseIP(strings.Trim(host, "[]")); ip != nil {
 		if isBlockedTargetIP(ip) {
 			return false
 		}
+		// Normalizing an IP-literal domain string skips a redundant DNS lookup.
 		ob.Target.Address = xnet.IPAddress(ip)
 		return true
+	}
+	key := strings.ToLower(strings.TrimSuffix(host, "."))
+	if key == "" {
+		return false
+	}
+	// Keep the domain intact for Freedom's dialer so IPv6-only nodes,
+	// Happy Eyeballs, and multi-IP fallback stay operational; Freedom's
+	// finalRules still enforce post-dial RemoteAddr validation.
+	return g.allowDomain(ctx, key, host, lookup)
+}
+
+func (g *Gate) allowDomain(ctx context.Context, key, host string, lookup func(context.Context, string, string) ([]net.IP, error)) bool {
+	if ctx.Err() != nil {
+		return false
 	}
 	if lookup == nil {
 		lookup = net.DefaultResolver.LookupIP
 	}
-	rctx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	defer cancel()
-	ips, err := lookup(rctx, "ip", host)
-	if err != nil || len(ips) == 0 {
-		return false
+	now := time.Now()
+	g.resolveMu.Lock()
+	if entry, ok := g.resolveCache[key]; ok && now.Before(entry.expiresAt) {
+		g.resolveMu.Unlock()
+		return entry.allowed
 	}
-	var chosen net.IP
-	for _, ip := range ips {
-		if isBlockedTargetIP(ip) {
+	if g.resolveFly == nil {
+		g.resolveFly = make(map[string]*resolveFlight)
+	}
+	if flight, ok := g.resolveFly[key]; ok {
+		g.resolveMu.Unlock()
+		select {
+		case <-flight.done:
+			return flight.allowed
+		case <-ctx.Done():
 			return false
 		}
-		if chosen == nil || (chosen.To4() == nil && ip.To4() != nil) {
-			chosen = ip
-		}
 	}
-	if chosen == nil {
+	flight := &resolveFlight{done: make(chan struct{})}
+	g.resolveFly[key] = flight
+	g.resolveMu.Unlock()
+
+	go func() {
+		rctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		ips, err := lookup(rctx, "ip", host)
+		allowed := false
+		ttl := gateResolveNegTTL
+		if err == nil && len(ips) > 0 {
+			allowed = true
+			for _, ip := range ips {
+				if isBlockedTargetIP(ip) {
+					allowed = false
+					break
+				}
+			}
+			ttl = gateResolveTTL
+		}
+
+		g.resolveMu.Lock()
+		delete(g.resolveFly, key)
+		if g.resolveCache == nil || len(g.resolveCache) >= gateResolveMaxEntry {
+			g.resolveCache = make(map[string]gateResolveEntry)
+		}
+		g.resolveCache[key] = gateResolveEntry{allowed: allowed, expiresAt: time.Now().Add(ttl)}
+		flight.allowed = allowed
+		close(flight.done)
+		g.resolveMu.Unlock()
+	}()
+
+	select {
+	case <-flight.done:
+		return flight.allowed
+	case <-ctx.Done():
 		return false
 	}
-	ob.Target.Address = xnet.IPAddress(chosen)
-	return true
 }
 
 var extraBlockedPrefixes = func() []netip.Prefix {
@@ -1400,23 +1511,59 @@ func (w *rateWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
 func (w *rateWriter) Close() error { return common.Close(w.w) }
 func (w *rateWriter) Interrupt()   { _ = common.Interrupt(w.w) }
 
-// waitLimits applies every limiter to n bytes. rate.Limiter.WaitN rejects n
-// larger than the burst, so large buffers are consumed in burst-sized chunks.
+// waitLimits applies every limiter to n bytes. rate.Limiter rejects n larger
+// than the burst, so large buffers are consumed in burst-sized chunks via
+// ReserveN and retried if a concurrent SetBurst shrinks burst mid-call.
 func waitLimits(ctx context.Context, lims []*rate.Limiter, n int) error {
 	for _, lim := range lims {
-		burst := lim.Burst()
-		if burst <= 0 {
-			burst = n
-		}
 		for remaining := n; remaining > 0; {
+			burst := lim.Burst()
+			if burst <= 0 {
+				burst = remaining
+			}
 			chunk := remaining
 			if chunk > burst {
 				chunk = burst
 			}
-			if err := lim.WaitN(ctx, chunk); err != nil {
-				return err
+			for {
+				if err := ctx.Err(); err != nil {
+					return err
+				}
+				now := time.Now()
+				r := lim.ReserveN(now, chunk)
+				if r.OK() {
+					delay := r.DelayFrom(now)
+					if delay > 0 {
+						if deadline, ok := ctx.Deadline(); ok && delay > deadline.Sub(now) {
+							r.CancelAt(now)
+							return fmt.Errorf("rate: Wait(n=%d) would exceed context deadline", chunk)
+						}
+						timer := time.NewTimer(delay)
+						select {
+						case <-timer.C:
+							timer.Stop()
+						case <-ctx.Done():
+							timer.Stop()
+							r.Cancel()
+							return ctx.Err()
+						}
+					}
+					remaining -= chunk
+					break
+				}
+				b := lim.Burst()
+				if b <= 0 {
+					return fmt.Errorf("rate: Wait(n=%d) exceeds limiter's burst %d", chunk, b)
+				}
+				if b < chunk {
+					chunk = b
+				} else if chunk > 1 {
+					// Burst shrank during ReserveN and then grew back before lim.Burst().
+					chunk /= 2
+				} else {
+					return fmt.Errorf("rate: Wait(n=%d) exceeds limiter's burst %d", chunk, b)
+				}
 			}
-			remaining -= chunk
 		}
 	}
 	return nil

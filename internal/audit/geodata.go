@@ -135,6 +135,9 @@ func (g *GeoData) compileGeo(id int64, prefix, value string) ([]compiled, error)
 	code, attr, hasAttr := strings.Cut(rawCode, "@")
 	code = strings.TrimSpace(code)
 	attr = strings.TrimSpace(attr)
+	if hasAttr && attr == "" {
+		return nil, fmt.Errorf("%s rule %q has empty attribute filter", prefix, rawCode)
+	}
 	switch prefix {
 	case "geosite":
 		g.mu.RLock()
@@ -145,7 +148,7 @@ func (g *GeoData) compileGeo(id int64, prefix, value string) ([]compiled, error)
 		}
 		out := make([]compiled, 0, len(domains))
 		for _, d := range domains {
-			if hasAttr && attr != "" && !domainHasAttr(d, attr) {
+			if hasAttr && !domainHasAttr(d, attr) {
 				continue
 			}
 			switch d.GetType() {
@@ -168,7 +171,7 @@ func (g *GeoData) compileGeo(id int64, prefix, value string) ([]compiled, error)
 		}
 		return out, nil
 	case "geoip":
-		if hasAttr && attr != "" {
+		if hasAttr {
 			return nil, fmt.Errorf("geoip does not support attribute filter %q", rawCode)
 		}
 		g.mu.RLock()

@@ -402,4 +402,21 @@ func TestRegexCaseInsensitiveAndGeoSiteAttr(t *testing.T) {
 	if id, _, ok := r.Match("global.example", nil, 443); ok {
 		t.Fatalf("geosite:test@cn must not match entry without @cn attr: id=%d", id)
 	}
+
+	geoip, _ := proto.Marshal(&xgeodata.GeoIPList{Entry: []*xgeodata.GeoIP{{
+		Code: "TEST",
+		Cidr: []*xgeodata.CIDR{{Ip: []byte{1, 2, 3, 0}, Prefix: 24}},
+	}}})
+	if err := os.WriteFile(filepath.Join(dir, "geoip.dat"), geoip, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	geo2, err := LoadGeodata(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, bad := range []string{"geosite:test@", "geosite:test@ ", "geoip:test@"} {
+		if _, _, err := Compile([]panel.AuditRule{{ID: 99, Rule: bad}}, nil, Config{Mode: "strict", Geo: geo2}); err == nil {
+			t.Fatalf("trailing @ rule %q must be rejected in strict mode", bad)
+		}
+	}
 }

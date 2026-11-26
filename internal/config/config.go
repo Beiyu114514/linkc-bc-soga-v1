@@ -401,9 +401,16 @@ func (c Config) Validate() error {
 	if c.Node.Audit.Action != "block" && c.Node.Audit.Action != "report" {
 		return fmt.Errorf("node.audit.action must be block|report")
 	}
-	if c.Node.TLS.ECHServerKeys != "" {
-		if _, err := base64.StdEncoding.DecodeString(c.Node.TLS.ECHServerKeys); err != nil {
+	if k := c.Node.TLS.ECHServerKeys; k != "" {
+		if strings.ContainsAny(k, "\x00\r\n \t") {
+			return fmt.Errorf("node.tls.ech_server_keys must not contain whitespace")
+		}
+		raw, err := base64.StdEncoding.DecodeString(k)
+		if err != nil {
 			return fmt.Errorf("node.tls.ech_server_keys must be base64: %w", err)
+		}
+		if len(raw) == 0 {
+			return fmt.Errorf("node.tls.ech_server_keys must decode to non-empty bytes")
 		}
 	}
 	if d := c.Node.VLESS.Decryption; d != "" && (len(d) > 8192 || strings.ContainsAny(d, "\x00\r\n \t")) {
