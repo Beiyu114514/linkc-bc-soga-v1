@@ -4,8 +4,8 @@
 #   sudo ./scripts/quickstart.sh --panel-url https://panel.example.com --node-id 12 \
 #     --api-key-stdin < /etc/linkc-node/api-key
 #   sudo ./scripts/quickstart.sh wizard                 # 交互式（逐步询问）
-#   sudo ./scripts/quickstart.sh --dry-run              # 只打印配置与将执行的命令
-#   sudo ./scripts/quickstart.sh --mode docker --panel-url ... --node-id 12 --api-key-env PANEL_API_KEY
+#   ./scripts/quickstart.sh --dry-run                    # 只打印配置与将执行的命令
+#   ./scripts/quickstart.sh --mode docker --panel-url ... --node-id 12 --api-key-env PANEL_API_KEY
 #
 # 模式:
 #   systemd     构建/安装二进制、systemd unit，写入 /etc/linkc-node 并启动（默认）
@@ -18,20 +18,22 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd -P -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd -- "$SCRIPT_DIR/.." && pwd)"
+# shellcheck source=scripts/install_paths.sh
+. "$SCRIPT_DIR/install_paths.sh"
 
 # 路径（测试/预发环境可用环境变量覆盖；正式环境保持默认值）
-BIN_DIR="${LINKC_BIN_DIR:-/usr/local/bin}"
-CONF_DIR="${LINKC_CONF_DIR:-/etc/linkc-node}"
-STATE_DIR="${LINKC_STATE_DIR:-/var/lib/linkc-node}"
-RUN_DIR="${LINKC_RUN_DIR:-/run/linkc-node}"
-UNIT_DIR="${LINKC_UNIT_DIR:-/etc/systemd/system}"
+BIN_DIR_INPUT="${LINKC_BIN_DIR:-/usr/local/bin}"
+CONF_DIR_INPUT="${LINKC_CONF_DIR:-/etc/linkc-node}"
+STATE_DIR_INPUT="${LINKC_STATE_DIR:-/var/lib/linkc-node}"
+RUN_DIR_INPUT="${LINKC_RUN_DIR:-/run/linkc-node}"
+UNIT_DIR_INPUT="${LINKC_UNIT_DIR:-/etc/systemd/system}"
 UNIT_NAME="linkc-node"
 SKIP_SYSTEMCTL="${LINKC_SKIP_SYSTEMCTL:-0}"
 
-CONF="$CONF_DIR/config.yaml"
-API_KEY_PATH="$CONF_DIR/api-key"
-WHITELIST_PATH="$CONF_DIR/whitelist.txt"
-SOCKET_PATH="$RUN_DIR/admin.sock"
+CONF=""
+API_KEY_PATH=""
+WHITELIST_PATH=""
+SOCKET_PATH=""
 LOCAL_BIN="$REPO_ROOT/linkc-node"
 
 DEFAULT_IMAGE="ghcr.io/beiyu114514/linkc-bc-soga-v1:latest"
@@ -120,7 +122,7 @@ Docker 模式:
   sudo ./scripts/quickstart.sh wizard
 
   # 先看要做什么
-  sudo ./scripts/quickstart.sh --dry-run \
+  ./scripts/quickstart.sh --dry-run \
     --panel-url https://panel.example.com --node-id 12 --api-key-env PANEL_API_KEY
 EOF
 }
@@ -217,11 +219,33 @@ case "$LOG_FORMAT" in
   json|text) ;;
   *) die "--log-format 只能是 json|text" ;;
 esac
+[[ "$WAIT_SECONDS" =~ ^[0-9]+$ ]] || die "--wait 必须是非负整数秒"
+WAIT_SECONDS=$((10#$WAIT_SECONDS))
+[[ "$WAIT_SECONDS" -ge 0 ]] || die "--wait 超出有效范围"
+if [[ -n "$API_KEY_ENV" && ! "$API_KEY_ENV" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
+  die "--api-key-env 必须是有效的环境变量名"
+fi
+
+BIN_DIR="$(normalize_install_path LINKC_BIN_DIR "$BIN_DIR_INPUT" /usr/local/bin)" || exit 1
+CONF_DIR="$(normalize_install_path LINKC_CONF_DIR "$CONF_DIR_INPUT" /etc/linkc-node)" || exit 1
+STATE_DIR="$(normalize_install_path LINKC_STATE_DIR "$STATE_DIR_INPUT" /var/lib/linkc-node)" || exit 1
+RUN_DIR="$(normalize_install_path LINKC_RUN_DIR "$RUN_DIR_INPUT" /run/linkc-node)" || exit 1
+UNIT_DIR="$(normalize_install_path LINKC_UNIT_DIR "$UNIT_DIR_INPUT" /etc/systemd/system)" || exit 1
+ensure_disjoint_install_paths "$BIN_DIR" "$CONF_DIR" "$STATE_DIR" "$RUN_DIR" "$UNIT_DIR" || exit 1
+
+CONF="$CONF_DIR/config.yaml"
+API_KEY_PATH="$CONF_DIR/api-key"
+WHITELIST_PATH="$CONF_DIR/whitelist.txt"
+SOCKET_PATH="$RUN_DIR/admin.sock"
+ensure_managed_file_slot "$CONF" "config file" || exit 1
+ensure_managed_file_slot "$API_KEY_PATH" "API Key file" || exit 1
+ensure_managed_file_slot "$WHITELIST_PATH" "whitelist file" || exit 1
 
 have_systemd() { [[ -d /run/systemd/system ]] && command -v systemctl >/dev/null 2>&1; }
 have_docker() { command -v docker >/dev/null 2>&1; }
 
-if [[ "$MODE" == "auto" ]]; then
+resolve_mode() {
+  [[ "$MODE" == "auto" ]] || return 0
   if have_systemd; then
     MODE="systemd"
   elif have_docker; then
@@ -229,7 +253,8 @@ if [[ "$MODE" == "auto" ]]; then
   else
     MODE="foreground"
   fi
-fi
+}
+resolve_mode
 
 # ---- 提权 -------------------------------------------------------------------
 # 必须早于向导输入与 --api-key-stdin 读取：sudo 重新执行会丢失已输入的内容。
@@ -245,30 +270,28 @@ escalate_preserving_env() { # 保留 ESCALATE_ENV_NAMES 与 API Key 相关变量
   [[ -n "${API_KEY_ENV:-}" ]] && extra+=("$API_KEY_ENV")
   extra+=(PANEL_API_KEY)
 
-  local -a sudo_args=()
-  local keep_env=" "
   local v name
   for name in "${extra[@]}"; do
     [[ -n "$name" && -n "${!name:-}" ]] || continue
-    case "$keep_env" in *" $name "*) continue ;; esac
-    keep_env="$keep_env$name "
     names+=("$name")
   done
 
+  local seen=""
   for v in "${names[@]}"; do
     [[ -n "${!v:-}" ]] || continue
-    if sudo -n --preserve-env="$v" true >/dev/null 2>&1; then
-      sudo_args+=("--preserve-env=$v")
+    case ",$seen," in *",$v,"*) continue ;; esac
+    if [[ -n "$seen" ]]; then
+      seen="$seen,$v"
     else
-      sudo_args+=("$v=${!v}")
+      seen="$v"
     fi
   done
 
   log "需要 root 权限，使用 sudo 重新执行"
-  if [[ ${#sudo_args[@]} -eq 0 ]]; then
+  if [[ -z "$seen" ]]; then
     exec sudo -- "$BASH" "$0" "${ORIG_ARGS[@]}"
   fi
-  exec sudo "${sudo_args[@]}" -- "$BASH" "$0" "${ORIG_ARGS[@]}"
+  exec sudo --preserve-env="$seen" -- "$BASH" "$0" "${ORIG_ARGS[@]}"
 }
 
 if [[ "$(id -u)" -ne 0 && "$DRY_RUN" == 0 ]]; then
@@ -284,6 +307,10 @@ if [[ "$(id -u)" -ne 0 && "$DRY_RUN" == 0 ]]; then
     escalate_preserving_env
   fi
 fi
+
+ensure_managed_file_slot "$CONF" "config file" || exit 1
+ensure_managed_file_slot "$API_KEY_PATH" "API Key file" || exit 1
+ensure_managed_file_slot "$WHITELIST_PATH" "whitelist file" || exit 1
 
 # ---- 交互式向导 -------------------------------------------------------------
 prompt() { # prompt VAR "说明" "默认值"
@@ -337,6 +364,21 @@ if [[ "$WIZARD" == 1 ]]; then
     fi
   fi
 fi
+
+# 向导会直接覆盖这些值，不能只校验命令行参数。
+case "$MODE" in
+  auto|systemd|docker|foreground) ;;
+  *) die "启动模式只能是 auto|systemd|docker|foreground" ;;
+esac
+case "$LIMITS_MODE" in
+  enforce|report|off) ;;
+  *) die "限速模式只能是 enforce|report|off" ;;
+esac
+case "$AUDIT_ACTION" in
+  report|block) ;;
+  *) die "审计动作只能是 report|block" ;;
+esac
+resolve_mode
 
 # ---- 取值校验 ---------------------------------------------------------------
 [[ -n "$PANEL_URL" ]] || die "缺少 --panel-url（或用 wizard 交互输入）"
@@ -547,8 +589,32 @@ build_binary() {
 
 # ---- 前台模式 ---------------------------------------------------------------
 if [[ "$MODE" == "foreground" ]]; then
-  build_binary
   FG_CONF="$CONF"
+  if [[ "$DRY_RUN" == 1 ]]; then
+    echo "# ---- $FG_CONF ----"
+    if [[ -f "$CONF" && "$FORCE" == 0 ]]; then
+      sed 's/^/# /' "$CONF"
+      FG_PREVIEW_CONF="$FG_CONF"
+    else
+      (
+        API_KEY_PATH="<temporary-directory>/api-key"
+        WHITELIST_PATH="<temporary-directory>/whitelist.txt"
+        STATE_DIR="<temporary-directory>/state"
+        RUN_DIR="<temporary-directory>/run"
+        SOCKET_PATH="<temporary-directory>/run/admin.sock"
+        render_config
+      )
+      FG_PREVIEW_CONF="<temporary-config>"
+    fi
+    echo
+    echo "# ---- 将执行的命令 ----"
+    if [[ "$REBUILD" == 1 || ! -x "$LOCAL_BIN" ]]; then
+      printf '+ cd %q && make build\n' "$REPO_ROOT"
+    fi
+    printf '+'; printf ' %q' "$LOCAL_BIN" run -c "$FG_PREVIEW_CONF"; printf '\n'
+    exit 0
+  fi
+  build_binary
   if [[ ! -f "$CONF" || "$FORCE" == 1 ]]; then
     [[ -n "$NEW_API_KEY" ]] || die "生成临时配置需要 API Key（--api-key-*）"
     FG_DIR="$(mktemp -d)"
@@ -568,12 +634,6 @@ if [[ "$MODE" == "foreground" ]]; then
     chmod 0600 "$FG_CONF"
     log "使用临时配置: $FG_CONF"
   fi
-  if [[ "$DRY_RUN" == 1 ]]; then
-    echo "# ---- $FG_CONF ----"
-    sed 's/^/# /' "$FG_CONF"
-    printf '+'; printf ' %q' "$LOCAL_BIN" run -c "$FG_CONF"; printf '\n'
-    exit 0
-  fi
   log "前台运行: $FG_CONF（Ctrl+C 退出）"
   exec "$LOCAL_BIN" run -c "$FG_CONF"
 fi
@@ -591,12 +651,12 @@ if [[ "$DRY_RUN" == 1 ]]; then
   echo "# ---- 将执行的步骤 ----"
   echo "1. 构建（若 ./linkc-node 不存在）: make build"
   echo "2. 安装二进制与 systemd unit: $BIN_DIR/linkc-node, $UNIT_DIR/$UNIT_NAME.service"
-  echo "3. 写入配置: $CONF (0600 linkc:linkc), API Key: $API_KEY_PATH"
+  echo "3. 写入配置: $CONF (0640 root:linkc), API Key: $API_KEY_PATH"
   echo "4. 本地校验: $BIN_DIR/linkc-node check -c $CONF"
   if [[ "$STAGE_ONLY" == 1 ]]; then
     echo "5. --stage-only：到此为止，不启动服务"
   else
-    echo "5. 启动: systemctl enable --now $UNIT_NAME"
+    echo "5. 启用并重启: systemctl enable $UNIT_NAME.service && systemctl restart $UNIT_NAME.service"
     echo "6. 等待 ready: $SOCKET_PATH（最多 ${WAIT_SECONDS}s）"
   fi
   exit 0
@@ -612,47 +672,60 @@ build_binary
 
 # 安装用户、目录、二进制与 unit（复用 install.sh，跳过它的示例配置）
 log "安装二进制、用户与 systemd unit"
+# install.sh 只负责落盘；配置校验通过后由 quickstart 统一执行 systemd 操作。
 LINKC_BIN_DIR="$BIN_DIR" \
 LINKC_CONF_DIR="$CONF_DIR" \
 LINKC_STATE_DIR="$STATE_DIR" \
 LINKC_RUN_DIR="$RUN_DIR" \
 LINKC_UNIT_DIR="$UNIT_DIR" \
-LINKC_SKIP_SYSTEMCTL="$SKIP_SYSTEMCTL" \
+LINKC_SKIP_SYSTEMCTL=1 \
 LINKC_SKIP_EXAMPLE_CONFIG=1 \
   sh "$SCRIPT_DIR/install.sh" "$CONF"
+
+# install.sh has now made the config directory root-owned; re-check before any
+# privileged chown/chmod so a symlink raced in by the service user is rejected.
+ensure_managed_file_slot "$CONF" "config file" || exit 1
+ensure_managed_file_slot "$API_KEY_PATH" "API Key file" || exit 1
+ensure_managed_file_slot "$WHITELIST_PATH" "whitelist file" || exit 1
 
 # 配置文件
 if [[ -s "$CONF" && "$FORCE" == 0 ]]; then
   log "保留已有配置: $CONF（如需重写加 --force）"
 else
   if [[ -f "$CONF" ]]; then
-    backup="$CONF.bak.$(date +%Y%m%d%H%M%S)"
-    n=1
-    while [[ -e "$backup" ]]; do
-      backup="$CONF.bak.$(date +%Y%m%d%H%M%S).$n"
-      n=$((n + 1))
-    done
-    cp -p "$CONF" "$backup"
+    backup="$(mktemp "$CONF.bak.$(date +%Y%m%d%H%M%S).XXXXXX")"
+    cp -- "$CONF" "$backup"
+    chown root:root "$backup"
+    chmod 0600 "$backup"
     log "已备份旧配置: $backup"
     # 只保留最近 5 份，避免反复 --force 把配置目录撑满
-    ls -1t -- "$CONF".bak.* 2>/dev/null | tail -n +6 | while IFS= read -r old; do rm -f -- "$old"; done
+    while IFS= read -r -d '' entry; do
+      rm -f -- "${entry#* }"
+    done < <(
+      find "$CONF_DIR" -maxdepth 1 -type f -name 'config.yaml.bak.*' -printf '%T@ %p\0' |
+        sort -z -rn |
+        tail -z -n +6
+    )
   fi
   log "写入配置: $CONF"
-  render_config > "$CONF"
+  render_config | write_managed_file "$CONF" 0640 root:linkc
 fi
 
 if [[ -n "$NEW_API_KEY" ]]; then
   log "写入 API Key: $API_KEY_PATH"
-  printf '%s\n' "$NEW_API_KEY" > "$API_KEY_PATH"
-  chmod 0600 "$API_KEY_PATH"
+  printf '%s\n' "$NEW_API_KEY" | write_managed_file "$API_KEY_PATH" 0600 linkc:linkc
 fi
 
-[[ -f "$WHITELIST_PATH" ]] || : > "$WHITELIST_PATH"
+if [[ ! -f "$WHITELIST_PATH" ]]; then
+  write_managed_file "$WHITELIST_PATH" 0600 linkc:linkc </dev/null
+fi
 
-chown linkc:linkc "$CONF" "$API_KEY_PATH" "$WHITELIST_PATH"
-chmod 0600 "$CONF" "$API_KEY_PATH" "$WHITELIST_PATH"
-chown -R linkc:linkc "$CONF_DIR" "$STATE_DIR" 2>/dev/null || true
-chmod 0700 "$CONF_DIR" "$STATE_DIR"
+chown root:linkc "$CONF_DIR" "$CONF"
+chmod 0750 "$CONF_DIR"
+chmod 0640 "$CONF"
+chown linkc:linkc "$API_KEY_PATH" "$WHITELIST_PATH" "$STATE_DIR"
+chmod 0600 "$API_KEY_PATH" "$WHITELIST_PATH"
+chmod 0700 "$STATE_DIR"
 
 mkdir -p "$RUN_DIR"
 chown linkc:linkc "$RUN_DIR"
@@ -673,15 +746,14 @@ log "校验配置: $BIN_DIR/linkc-node check -c $CONF"
 
 if [[ "$STAGE_ONLY" == 1 ]]; then
   log "配置已就绪（--stage-only，未启动服务）"
-  printf '启动: %s\n' "systemctl enable --now $UNIT_NAME"
+  printf '启动: %s\n' "systemctl enable $UNIT_NAME.service && systemctl restart $UNIT_NAME.service"
   exit 0
 fi
 
 # 启动服务
 if [[ "$SKIP_SYSTEMCTL" != "1" ]]; then
-  log "启动服务: systemctl enable --now $UNIT_NAME"
-  systemctl daemon-reload
-  systemctl enable --now "$UNIT_NAME.service"
+  log "启用并重启服务: systemctl enable $UNIT_NAME.service && systemctl restart $UNIT_NAME.service"
+  enable_and_restart_service "$UNIT_NAME.service"
 else
   warn "LINKC_SKIP_SYSTEMCTL=1，跳过 systemd 启动"
 fi
@@ -718,7 +790,7 @@ fi
 echo
 if [[ "$STARTED" == 0 ]]; then
   echo "ℹ️  配置与二进制已就绪，但未启动服务（LINKC_SKIP_SYSTEMCTL=1）"
-  printf '   手动启动: systemctl enable --now %s.service\n' "$UNIT_NAME"
+  printf '   手动启动: systemctl enable %s.service && systemctl restart %s.service\n' "$UNIT_NAME" "$UNIT_NAME"
 elif [[ "$SKIPPED_WAIT" == 1 ]]; then
   echo "ℹ️  linkc-node 已启动；--wait 0 跳过了就绪检查"
   echo "   手动确认: $BIN_DIR/linkc-node ready -c $CONF"

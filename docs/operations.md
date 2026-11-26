@@ -38,7 +38,9 @@ printf '%s\n' "$PANEL_API_KEY" | sudo ./scripts/quickstart.sh \
 
 `install.sh` 可用 `LINKC_BIN_DIR` / `LINKC_CONF_DIR` / `LINKC_STATE_DIR` / `LINKC_RUN_DIR` /
 `LINKC_UNIT_DIR` 覆盖安装路径，`LINKC_SKIP_EXAMPLE_CONFIG=1` 跳过示例配置，
-`LINKC_SKIP_SYSTEMCTL=1` 跳过 `systemctl`（仅供测试/打包使用）。
+`LINKC_SKIP_SYSTEMCTL=1` 跳过 `systemctl`（仅供测试/打包使用）。覆盖值必须是绝对路径，
+不能指向系统级目录或彼此重叠；自定义目录的名称或父目录名称必须使用 `linkc-node` 专用名称。
+受管配置文件也不能是符号链接。
 
 ## systemd
 
@@ -46,11 +48,13 @@ printf '%s\n' "$PANEL_API_KEY" | sudo ./scripts/quickstart.sh \
 
 ```bash
 useradd --system --home /var/lib/linkc-node --shell /usr/sbin/nologin linkc
-install -d -m 0700 -o linkc -g linkc /etc/linkc-node /var/lib/linkc-node
-install -m 0600 -o linkc -g linkc config.yaml /etc/linkc-node/config.yaml
+install -d -m 0750 -o root -g linkc /etc/linkc-node
+install -d -m 0700 -o linkc -g linkc /var/lib/linkc-node /run/linkc-node
+install -m 0640 -o root -g linkc config.yaml /etc/linkc-node/config.yaml
 install -m 0644 deploy/linkc-node.service /etc/systemd/system/
 systemctl daemon-reload
-systemctl enable --now linkc-node
+systemctl enable linkc-node
+systemctl restart linkc-node
 journalctl -u linkc-node -f
 ```
 

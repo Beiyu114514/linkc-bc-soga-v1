@@ -63,13 +63,15 @@ jobs:
         run: python3 -m compileall -q scripts/docker_launcher.py scripts/test_docker_launcher.py
       - name: launcher unit tests
         run: python3 -m unittest discover -s scripts -p 'test_*.py' -v
+      - name: quickstart regression tests
+        run: make test-quickstart
       - name: shell syntax & cli help
         run: |
-          bash -n scripts/docker-launch.sh scripts/quickstart.sh
+          bash -n scripts/docker-launch.sh scripts/quickstart.sh scripts/install_paths.sh scripts/test_quickstart.sh
           python3 scripts/docker_launcher.py --help >/dev/null
           ./scripts/quickstart.sh --help >/dev/null
           ./scripts/quickstart.sh --dry-run --panel-url https://panel.example.com --node-id 1 --api-key ci-dummy >/dev/null
-          sh -n scripts/install.sh packaging/preinstall.sh packaging/postinstall.sh packaging/preremove.sh packaging/postremove.sh
+          sh -n scripts/install.sh scripts/install_paths.sh packaging/preinstall.sh packaging/postinstall.sh packaging/preremove.sh packaging/postremove.sh
 
   build:
     runs-on: ubuntu-latest

@@ -9,7 +9,7 @@ LDFLAGS := -s -w \
   -X github.com/Beiyu114514/linkc-bc-soga-v1/internal/version.Commit=$(COMMIT) \
   -X github.com/Beiyu114514/linkc-bc-soga-v1/internal/version.Date=$(DATE)
 
-.PHONY: quickstart all build linux-amd64 linux-arm64 test race vet fmt clean clean-dist package-deb package-rpm release-artifacts soak bench docker-launch test-launcher
+.PHONY: quickstart all build linux-amd64 linux-arm64 test race vet fmt clean clean-dist package-deb package-rpm release-artifacts soak bench docker-launch test-launcher test-quickstart
 
 all: build
 
@@ -77,3 +77,9 @@ quickstart:
 # Unit tests for the Docker launcher (stdlib only; no Docker or root needed).
 test-launcher:
 	python3 -m unittest discover -s scripts -p 'test_*.py' -v
+
+# Regression tests for installer path safety and quickstart argument handling.
+test-quickstart:
+	bash -n scripts/quickstart.sh scripts/install_paths.sh scripts/test_quickstart.sh
+	sh -n scripts/install.sh scripts/install_paths.sh
+	bash scripts/test_quickstart.sh

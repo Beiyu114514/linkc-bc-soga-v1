@@ -88,9 +88,9 @@ sudo ./scripts/quickstart.sh wizard
 ./scripts/quickstart.sh --dry-run --panel-url https://panel.example.com --node-id 12 --api-key-env PANEL_API_KEY
 ```
 
-脚本会生成 `/etc/linkc-node/config.yaml`（0600）与 `/etc/linkc-node/api-key`，复用
-`scripts/install.sh` 安装 `linkc` 用户与 systemd unit，`check` 通过后 `systemctl enable --now`，
-最后轮询 `readyz` 并打印 `status`；未就绪时自动附带最近日志。
+脚本会生成 `/etc/linkc-node/config.yaml`（`root:linkc` 0640）与 `/etc/linkc-node/api-key`
+（`linkc:linkc` 0600），复用 `scripts/install.sh` 安装 `linkc` 用户与 systemd unit；
+`check` 通过后启用并重启服务，最后轮询 `readyz` 并打印 `status`，未就绪时自动附带最近日志。
 
 `--mode docker` 会转调下面的 `scripts/docker-launch.sh deploy`；`--mode foreground` 直接前台运行。
 完整参数见 `./scripts/quickstart.sh --help` 与 [docs/quickstart.md](./docs/quickstart.md)。

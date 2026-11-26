@@ -33,9 +33,10 @@ sudo ./scripts/quickstart.sh wizard
 ./scripts/quickstart.sh --dry-run --panel-url https://panel.example.com --node-id 12 --api-key-env PANEL_API_KEY
 ```
 
-它会写入 `/etc/linkc-node/config.yaml`（最小可用配置，0600）与 `/etc/linkc-node/api-key`，
+它会写入 `/etc/linkc-node/config.yaml`（最小可用配置，`root:linkc` 0640）与
+`/etc/linkc-node/api-key`（`linkc:linkc` 0600），
 复用 `scripts/install.sh` 安装 `linkc` 用户、二进制与 unit，`check` 通过后
-`systemctl enable --now linkc-node`，最后轮询 `readyz` 并打印 `status`；未就绪时附带最近日志。
+启用并显式重启服务，最后轮询 `readyz` 并打印 `status`；未就绪时附带最近日志。
 
 常用开关：`--mode docker`（转调 `scripts/docker-launch.sh deploy`）、`--mode foreground`（前台调试）、
 `--cert-file/--key-file`（TLS 证书对）、`--audit-action block`、`--stage-only`（只生成配置）、
@@ -58,7 +59,8 @@ make build
 sudo ./scripts/install.sh
 ```
 
-`scripts/install.sh` 只负责安装，不启动服务；配置需自行准备，然后 `systemctl enable --now linkc-node`。
+`scripts/install.sh` 只负责安装，不启动服务；配置需自行准备，然后
+`systemctl enable linkc-node && systemctl restart linkc-node`。
 
 ### 2.2 Docker
 
@@ -75,14 +77,15 @@ docker run -d --name linkc-node --network host --restart unless-stopped \
 
 ```bash
 sudo ./scripts/docker-launch.sh wizard
-# 或 sudo ./scripts/quickstart.sh --mode docker --panel-url https://panel.example.com --node-id 12 --api-key-env PANEL_API_KEY
+# 或 ./scripts/quickstart.sh --mode docker --panel-url https://panel.example.com --node-id 12 --api-key-env PANEL_API_KEY
 ```
 
 详见 [docker-launcher.md](./docker-launcher.md)。
 
 ## 3. 配置
 
-配置文件默认 `/etc/linkc-node/config.yaml`，权限 `0600`，目录 `0700`。
+配置文件默认 `/etc/linkc-node/config.yaml`，权限 `0640 root:linkc`，
+目录权限 `0750 root:linkc`；API Key 文件为 `0600 linkc:linkc`。
 完整示例见 [`configs/linkc-node.example.yaml`](../configs/linkc-node.example.yaml)。
 
 最小可用配置：

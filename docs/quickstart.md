@@ -43,7 +43,7 @@ sudo ./scripts/quickstart.sh wizard
 ==> 写入配置: /etc/linkc-node/config.yaml
 ==> 校验配置: /usr/local/bin/linkc-node check -c /etc/linkc-node/config.yaml
 config ok
-==> 启动服务: systemctl enable --now linkc-node
+==> 启用并重启服务: systemctl enable linkc-node && systemctl restart linkc-node
 ==> 等待节点就绪（最多 30s）
 
 ✅ linkc-node 已启动并就绪
@@ -59,7 +59,7 @@ config ok
 | `--panel-url URL` | 面板地址，必须 `https://`（测试环境加 `--allow-http`） |
 | `--node-id ID` | 面板节点 ID |
 | `--api-key-stdin` | 从标准输入读一行作为 API Key |
-| `--api-key-env NAME` | 从环境变量读取（推荐，避免 `ps` 泄漏） |
+| `--api-key-env NAME` | 从环境变量读取（推荐；直接运行脚本让脚本自行 sudo，变量值不会进入 `ps`） |
 | `--api-key-file PATH` | 从文件读取 |
 | `--api-key VALUE` | 直接写在命令行，会暴露在 `ps`，不推荐 |
 | `--profile NAME` | 面板协议，默认 `sspanel-uim-soga` |
@@ -84,7 +84,7 @@ config ok
 
 | 模式 | 行为 | 适用场景 |
 |---|---|---|
-| `systemd`（默认*） | 构建二进制 → `scripts/install.sh` 安装用户/unit → 写配置 → `check` → `systemctl enable --now` → 等 `readyz` | 生产部署、裸机或 VPS |
+| `systemd`（默认*） | 构建二进制 → `scripts/install.sh` 安装用户/unit → 写配置 → `check` → `systemctl enable` + `restart` → 等 `readyz` | 生产部署、裸机或 VPS |
 | `docker` | 转调 `scripts/docker-launch.sh deploy`，生成配置与容器；启动后用 `node-ready` 等就绪 | 不想在宿主机装二进制 |
 | `foreground` | 用仓库内二进制前台运行；配置存在则用它，否则在临时目录生成一份并在退出后删除 | 调试、临时验证 |
 
@@ -92,8 +92,9 @@ config ok
 
 ## 生成的配置文件
 
-写入 `/etc/linkc-node/config.yaml`（0600，`linkc:linkc`），API Key 写在
-`/etc/linkc-node/api-key`（0600），凭 `api_key_file` 引用。默认生成的内容：
+写入 `/etc/linkc-node/config.yaml`（0640，`root:linkc`），API Key 写在
+`/etc/linkc-node/api-key`（0600，`linkc:linkc`），凭 `api_key_file` 引用。配置目录为
+`0750 root:linkc`，服务用户只能读取配置，不能替换文件。默认生成的内容：
 
 ```yaml
 panel:
@@ -141,14 +142,14 @@ admin:
 
 生成的是**最小可用配置**，其余字段使用程序默认值（见
 [configuration.md](./configuration.md)）。已有配置默认保留，加 `--force` 才会覆盖，
-覆盖前会把旧文件备份为 `config.yaml.bak.<时间戳>`（最多保留最近 5 份）；
+覆盖前会把旧文件备份为 `config.yaml.bak.<时间戳>.<随机后缀>`（最多保留最近 5 份）；
 需要更细的字段请直接编辑该文件后 `systemctl restart linkc-node`。
 
 ## 常见用法
 
 ```bash
 # 已有节点，只想换成 systemd 托管（保留现有配置）
-sudo ./scripts/quickstart.sh --panel-url https://panel.example.com --node-id 12 \
+./scripts/quickstart.sh --panel-url https://panel.example.com --node-id 12 \
   --api-key-env PANEL_API_KEY
 
 # 带 TLS 证书、直接开阻断
@@ -157,31 +158,34 @@ sudo ./scripts/quickstart.sh --panel-url https://panel.example.com --node-id 12 
   --audit-action block < /etc/linkc-node/api-key
 
 # Docker 方式部署
-sudo ./scripts/quickstart.sh --mode docker --panel-url https://panel.example.com \
+./scripts/quickstart.sh --mode docker --panel-url https://panel.example.com \
   --node-id 12 --api-key-env PANEL_API_KEY
 
 # 只生成配置，稍后手工启动
-sudo ./scripts/quickstart.sh --stage-only --panel-url https://panel.example.com \
+./scripts/quickstart.sh --stage-only --panel-url https://panel.example.com \
   --node-id 12 --api-key-env PANEL_API_KEY
 ```
 
 非 root 运行时脚本会自动 `sudo` 重新执行（`systemd` 模式，或当前用户无 docker 权限的 `docker` 模式），
-并显式保留 `--api-key-env` 所指向的变量与 `LINKC_*` 覆盖项；`--dry-run` 与 `foreground` 模式不提权。
+通过变量名保留 `--api-key-env` 所指向的变量与 `LINKC_*` 覆盖项，API Key 不进入 sudo 命令行；
+`--dry-run` 与 `foreground` 模式不提权。使用 `--api-key-env` 时不要在外层再包一层
+`sudo`，否则普通 sudo 会先清空该环境变量；直接运行脚本即可。
 
 ## 脚本做了什么
 
 1. 校验参数（面板地址必须 https、`node_id` 不能含空格等）；
 2. 构建二进制（已有 `./linkc-node` 且未加 `--build` 时跳过）；
 3. 复用 `scripts/install.sh`：创建 `linkc` 用户，安装 `/usr/local/bin/linkc-node`
-   与 `/etc/systemd/system/linkc-node.service`，创建 `/etc/linkc-node`、`/var/lib/linkc-node`、
-   `/run/linkc-node`（均 0700 且属主为 `linkc`）；
-4. 写 `config.yaml`、`api-key`、空 `whitelist.txt`（均 0600）；
+   与 `/etc/systemd/system/linkc-node.service`；配置目录为 `root:linkc` 0750，
+   状态与运行目录为 `linkc:linkc` 0700；
+4. 原子写入 `config.yaml`（`root:linkc` 0640）、`api-key` 与空 `whitelist.txt`
+   （均为 `linkc:linkc` 0600）；
 5. `linkc-node check` 做本地校验（不访问面板）；
-6. `systemctl daemon-reload && systemctl enable --now linkc-node`；
+6. `systemctl daemon-reload && systemctl enable linkc-node && systemctl restart linkc-node`；
 7. 轮询 `linkc-node ready` 直到 `readyz` 返回 200 或超时，然后打印一次 `status`。
 
-脚本是**幂等**的：重复执行会重装二进制与 unit、刷新 API Key 并 `systemctl enable --now`
-（已运行则等价于 restart），但已存在的 `config.yaml` 默认保留（改配置请编辑文件或加
+脚本是**幂等**的：重复执行会重装二进制与 unit、刷新 API Key，并显式重启服务，
+因此升级时新二进制与配置会立即生效；已存在的 `config.yaml` 默认保留（改配置请编辑文件或加
 `--force`，覆盖前自动备份），用户与目录不会重复创建。
 
 ## 与其它部署方式的关系
@@ -211,6 +215,10 @@ sudo ./scripts/quickstart.sh --stage-only --panel-url https://panel.example.com 
 | `LINKC_IMAGE` | Docker 模式默认镜像 |
 
 `foreground` 模式的临时目录不受上述变量影响，始终使用 `mktemp -d` 生成的位置。
+覆盖值必须是绝对路径；脚本会解析符号链接，拒绝系统级目录（如 `/`、`/etc`、`/usr/local/bin`）
+以及彼此重叠的安装目录。自定义目录的名称或其父目录名称必须使用 `linkc-node` 专用名称
+（例如 `/etc/linkc-node-test`、`/var/lib/linkc-node-test` 或 `/mnt/linkc-node/data`）。
+目录中受管的配置文件也不允许是符号链接。
 
 ## 排障
 
@@ -220,6 +228,6 @@ sudo ./scripts/quickstart.sh --stage-only --panel-url https://panel.example.com 
 | `⚠️ 未就绪` | 看脚本附带的 journal 尾部：面板不可达 / API Key 401 / 端口占用 / 证书不可读 |
 | `找不到 go 工具链` | 装 Go，或先 `make linux-amd64` 再把二进制放到仓库根目录 `./linkc-node` |
 | Docker 模式报 python 缺失 | 需要 Python 3.8+（`docker-launch.sh` 依赖） |
-| `--force` 覆盖了想保留的配置 | 覆盖前会自动备份为 `config.yaml.bak.<时间戳>`（最近 5 份），从中恢复即可 |
+| `--force` 覆盖了想保留的配置 | 覆盖前会自动备份为 `config.yaml.bak.<时间戳>.<随机后缀>`（最近 5 份），从中恢复即可 |
 
 启动后的日常操作见 [usage.md](./usage.md)，指标与告警见 [monitoring.md](./monitoring.md)。
