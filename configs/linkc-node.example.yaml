@@ -16,7 +16,7 @@ panel:
     server_name: ""
     client_cert_file: ""
     client_key_file: ""
-  proxy: ""                            # optional http:// proxy
+  proxy: ""                            # optional http(s):// or socks5(h):// proxy
   max_response_bytes: 33554432
   max_attempts: 3
 

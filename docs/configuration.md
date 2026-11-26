@@ -16,7 +16,7 @@
 | `allow_http` | `false` | 仅测试/内网允许 |
 | `follow_redirects` | `false` | 固定禁止，避免 API key 泄露 |
 | `tls.*` | verify=true | 自定义 CA、SNI、mTLS |
-| `proxy` | 空 | 可选 HTTP 代理，例如 `http://127.0.0.1:7890` |
+| `proxy` | 空 | 可选代理（支持 `http`/`https`/`socks5`/`socks5h`），例如 `http://127.0.0.1:7890` |
 | `max_attempts` | `3` | GET 重试次数；401/403 不重试 |
 
 ## node

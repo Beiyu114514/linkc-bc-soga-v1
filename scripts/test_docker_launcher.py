@@ -424,9 +424,154 @@ class CliAndUnixSocketTest(unittest.TestCase):
                 rc = dl.main(["node-ready", "-s", sock_path])
             self.assertEqual(rc, 1)
             self.assertIn("503", err_buf.getvalue())
+
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = dl.main(["node-status", "-s", sock_path, "--json"])
+            self.assertEqual(rc, 0)
+            self.assertEqual(json.loads(buf.getvalue()), {"ok": True, "ready": True, "users": 5})
+
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = dl.main(["node-ready", "-s", sock_path, "--json"])
+            self.assertEqual(rc, 1)
+            err_json = json.loads(buf.getvalue())
+            self.assertFalse(err_json["ok"])
+            self.assertEqual(err_json["status_code"], 503)
         finally:
             srv.shutdown()
             srv.server_close()
+
+    def test_cli_flags_and_proxy_validation(self):
+        for bad_flag in (
+            ["preview", "--alive-ip-mode", "off"],
+            ["preview", "--sniffing-mode", "on"],
+            ["preview", "--mass-remove-guard", "off"],
+        ):
+            with self.subTest(bad_flag=bad_flag), contextlib.redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit):
+                    dl.main(bad_flag)
+
+        buf = io.StringIO()
+        with mock.patch.dict(os.environ, {"TEST_PANEL_KEY": "env-secret-key"}), \
+             mock.patch.object(dl, "last_config_dir_path", lambda: self.tmp / "last"), \
+             mock.patch.object(dl, "docker_state", lambda: {"ok": False, "error": "no docker"}), \
+             contextlib.redirect_stdout(buf):
+            rc = dl.main([
+                "preview", "--fresh",
+                "--panel-url", "https://panel.example.com",
+                "--node-id", "42",
+                "--api-key-env", "TEST_PANEL_KEY",
+                "--panel-proxy", "socks5h://127.0.0.1:1080",
+                "--max-response-mb", "1024",
+                "--config-dir", str(self.tmp / "etc"),
+                "--data-dir", str(self.tmp / "data"),
+                "--json",
+            ])
+        self.assertEqual(rc, 0)
+        out = json.loads(buf.getvalue())
+        self.assertTrue(out["ok"])
+        self.assertIn('proxy: "socks5h://127.0.0.1:1080"', out["config"])
+        self.assertIn("max_response_bytes: 1073741824", out["config"])
+
+    def test_read_text_input_follows_cert_symlinks(self):
+        archive = self.tmp / "archive"
+        live = self.tmp / "live"
+        archive.mkdir()
+        live.mkdir()
+        real_cert = archive / "fullchain1.pem"
+        real_cert.write_text("CERTDATA", encoding="utf-8")
+        link_cert = live / "fullchain.pem"
+        link_cert.symlink_to(Path("..") / "archive" / "fullchain1.pem")
+        self.assertEqual(dl._read_text_input(str(link_cert), "--cert-file"), "CERTDATA")
+
+        broken = live / "broken.pem"
+        broken.symlink_to(archive / "missing.pem")
+        with self.assertRaises(dl.ValidationError):
+            dl._read_text_input(str(broken), "--cert-file")
+
+    def test_logs_json_honors_tail_and_errors(self):
+        seen_cmds = []
+
+        def fake_run(args, **kwargs):
+            seen_cmds.append(args)
+            if args[:2] == ["docker", "inspect"]:
+                return {"code": 0, "stdout": json.dumps([{"Id": "abc", "Name": "/c", "State": {"Status": "running", "Running": True}, "Config": {"Labels": {}}}]), "output": ""}
+            return {"code": 0, "stdout": "l1\nl2\n", "output": "l1\nl2\n"}
+
+        buf = io.StringIO()
+        with mock.patch.object(dl, "last_config_dir_path", lambda: self.tmp / "last"), \
+             mock.patch.object(dl, "run_cmd", fake_run), \
+             contextlib.redirect_stdout(buf):
+            rc = dl.main(["logs", "--container-name", "c", "--tail", "42", "--json"])
+        self.assertEqual(rc, 0)
+        self.assertTrue(any(cmd[:4] == ["docker", "logs", "--tail", "42"] for cmd in seen_cmds), seen_cmds)
+        self.assertTrue(json.loads(buf.getvalue())["ok"])
+
+        buf = io.StringIO()
+        with mock.patch.object(dl, "last_config_dir_path", lambda: self.tmp / "last"), \
+             contextlib.redirect_stdout(buf):
+            rc = dl.main(["logs", "--container-name", "c", "--follow", "--json"])
+        self.assertEqual(rc, 1)
+        self.assertFalse(json.loads(buf.getvalue())["ok"])
+
+    def test_container_state_reads_health_status(self):
+        payload = [{
+            "Id": "1234567890ab",
+            "Name": "/linkc-node",
+            "RestartCount": 0,
+            "State": {"Status": "running", "Running": True, "Health": {"Status": "healthy"}},
+            "Config": {"Image": "img:1", "Labels": {dl.MANAGED_LABEL: dl.MANAGED_VALUE}},
+        }]
+        with mock.patch.object(dl, "run_cmd", lambda *a, **kw: {"code": 0, "stdout": json.dumps(payload), "output": ""}):
+            st = dl.container_state("linkc-node")
+        self.assertEqual(st["health"], "healthy")
+
+    def test_wizard_eof_cancels_and_build_json_stdout_clean(self):
+        # EOF on stdin must cancel rather than deploying with defaults.
+        out_buf = io.StringIO()
+        with mock.patch.object(dl, "last_config_dir_path", lambda: self.tmp / "last"), \
+             mock.patch("sys.stdin", io.StringIO("")), \
+             contextlib.redirect_stdout(out_buf):
+            rc = dl.main(["wizard", "--fresh", "--config-dir", str(self.tmp / "etc")])
+        self.assertEqual(rc, 1)
+        self.assertIn("已取消", out_buf.getvalue())
+
+        # Wizard in --json mode with build image mode defaults image to linkc-node:local
+        # and keeps stdout strictly valid JSON.
+        answers = iter([
+            str(self.tmp / "etc"),
+            str(self.tmp / "data"),
+            "linkc-node",
+            "https://panel.example.com",
+            "42",
+            "0.0.0.0",
+            "none",
+            "build",
+            "",          # accept default linkc-node:local
+            "y",
+            "report",
+            "enforce",
+            "n",
+            "y",
+            "stage",
+        ])
+        out_buf = io.StringIO()
+        err_buf = io.StringIO()
+        with mock.patch.object(dl, "last_config_dir_path", lambda: self.tmp / "last"), \
+             mock.patch.object(dl, "docker_state", lambda: {"ok": False, "error": "no docker"}), \
+             mock.patch("builtins.input", lambda: next(answers)), \
+             mock.patch("getpass.getpass", lambda prompt: "wizard-secret"), \
+             contextlib.redirect_stdout(out_buf), \
+             contextlib.redirect_stderr(err_buf):
+            rc = dl.main(["wizard", "--fresh", "--json"])
+        self.assertEqual(rc, 0, err_buf.getvalue())
+        res = json.loads(out_buf.getvalue())
+        self.assertTrue(res["ok"])
+        saved = json.loads((self.tmp / "etc" / dl.METADATA_FILENAME).read_text(encoding="utf-8"))
+        self.assertEqual(saved["image"], "linkc-node:local")
+        self.assertIn("linkc-node:local", Path(res["paths"]["run_script_path"]).read_text(encoding="utf-8"))
+        self.assertIn("linkc-node Docker 命令行配置向导", err_buf.getvalue())
 
 
 class RestoreBackupFilesTest(unittest.TestCase):

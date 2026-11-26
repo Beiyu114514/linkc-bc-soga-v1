@@ -66,15 +66,13 @@ promtool check rules deploy/alerts.yml
 |---|---|---|
 | `LinkCNodeNotReady` | `linkc_ready == 0` 持续 5m | critical |
 | `LinkCNodeDegraded` | `linkc_degraded == 1` 持续 15m | warning |
-| `LinkCTrafficBacklog` | `linkc_traffic_pending_bytes > 100MB` 持续 15m | warning |
+| `LinkCTrafficBacklog` | `linkc_traffic_pending_bytes > 50MB` 持续 15m | warning |
 | `LinkCAuditBacklog` | `linkc_audit_pending > 1000` 持续 30m | warning |
 | `LinkCNoUsers` | `linkc_users == 0` 持续 10m | warning |
 | `LinkCLimitRejectsSpike` | 10m 内拒绝 > 100 | warning |
 | `LinkCAuditBlockedSpike` | 10m 内阻断 > 100 | info |
 
-按需调整阈值：`LinkCTrafficBacklog` 对应 PLAN §12.4 的「pending > 100MB 或
-> 1 小时未成功上报」；未成功上报时长可由 `linkc_traffic_pending_bytes`
-持续上升间接判断。
+按需调整阈值：`LinkCTrafficBacklog` 在默认告警规则中设为「pending > 50MB」（PLAN §12.4 原始基线为 100MB 或 > 1 小时未成功上报）；未成功上报时长可由 `linkc_traffic_pending_bytes` 持续上升间接判断。
 
 ## 4. 手动检查
 

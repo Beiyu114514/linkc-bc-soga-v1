@@ -2,9 +2,10 @@
 """
 CLI tool for deploying and managing linkc-node in Docker.
 
-The launcher writes a complete config.yaml, an api-key file (0600), optional
-TLS certificates, and a reproducible docker-run.sh, then deploys or manages
-the container with host networking.  It only uses the Python standard library.
+The launcher writes a complete config.yaml, an api-key file (0640 for root,
+0600 for non-root), optional TLS certificates, and a reproducible docker-run.sh,
+then deploys or manages the container with host networking.  It only uses the
+Python standard library.
 """
 
 from __future__ import annotations
@@ -423,8 +424,8 @@ def normalize_values(raw: Any) -> dict[str, Any]:
             raise ValidationError("panel.proxy 不能包含空白字符")
         _yaml_safe(values["panel_proxy"], "panel.proxy")
         parsed = urllib.parse.urlsplit(values["panel_proxy"])
-        if parsed.scheme not in ("http", "https") or not parsed.netloc:
-            raise ValidationError("panel.proxy 必须是 http(s)://host:port")
+        if parsed.scheme not in ("http", "https", "socks5", "socks5h") or not parsed.netloc:
+            raise ValidationError("panel.proxy 必须是 http(s)/socks5(h)://host:port")
 
     values["config_dir"] = _as_abs_path(values["config_dir"], "config_dir")
     values["data_dir"] = _as_abs_path(values["data_dir"], "data_dir")
@@ -1128,6 +1129,7 @@ def container_state(name: str) -> dict[str, Any]:
     state = data.get("State") or {}
     config = data.get("Config") or {}
     labels = config.get("Labels") or {}
+    health_status = ((state.get("Health") or {}).get("Status") or "")
     return {
         "exists": True,
         "managed": labels.get(MANAGED_LABEL) == MANAGED_VALUE,
@@ -1135,6 +1137,7 @@ def container_state(name: str) -> dict[str, Any]:
         "name": (data.get("Name") or "").lstrip("/"),
         "status": state.get("Status"),
         "running": state.get("Running"),
+        "health": health_status,
         "exit_code": state.get("ExitCode"),
         "started_at": state.get("StartedAt"),
         "finished_at": state.get("FinishedAt"),
@@ -1703,15 +1706,20 @@ def action_payload(action: str, payload: dict[str, Any], repo_root: Path) -> dic
                 "error": state.get("error") or f"容器 {name} 不存在",
                 "container": state,
             }
+        try:
+            tail = _as_int(payload.get("tail", 200), "tail", 1, 100000)
+        except ValidationError as exc:
+            return {"ok": False, "error": str(exc), "container": state}
         result = run_cmd(
-            ["docker", "logs", "--tail", "200", "--timestamps", name],
+            ["docker", "logs", "--tail", str(tail), "--timestamps", name],
             timeout=20,
         )
+        max_chars = min(max(20000, tail * 256), 1_000_000)
         return {
             "ok": result["code"] == 0,
             "action": action,
             "container": state,
-            "logs": tail_output(result["output"], 200, 20000),
+            "logs": tail_output(result["output"], tail, max_chars),
             "error": "" if result["code"] == 0 else tail_output(result["output"], 20),
         }
 
@@ -1912,13 +1920,15 @@ def query_admin_socket(socket_path: str, endpoint: str) -> tuple[int, str]:
 
 def _read_text_input(path_str: str, label: str, *, max_bytes: int = 2 * 1024 * 1024) -> str:
     path = Path(path_str).expanduser()
-    if path.is_symlink():
-        raise ValidationError(f"{label} 不能是符号链接: {path}")
-    if not path.is_file():
+    try:
+        resolved = path.resolve(strict=True)
+    except OSError as exc:
+        raise ValidationError(f"找不到 {label}: {path} ({exc})") from exc
+    if not resolved.is_file():
         raise ValidationError(f"找不到 {label}: {path}")
-    if path.stat().st_size > max_bytes:
+    if resolved.stat().st_size > max_bytes:
         raise ValidationError(f"{label} 过大: {path}")
-    return path.read_text(encoding="utf-8")
+    return resolved.read_text(encoding="utf-8")
 
 
 def _load_cli_values(args: argparse.Namespace) -> dict[str, Any]:
@@ -2048,111 +2058,123 @@ def _load_cli_values(args: argparse.Namespace) -> dict[str, Any]:
     return raw
 
 
-def _print_warnings(warnings: list[dict[str, str]]) -> None:
+def _print_warnings(warnings: list[dict[str, str]], *, file: Any = None) -> None:
     if not warnings:
         return
-    print("\n提示/告警:")
+    out = file or sys.stdout
+    print("\n提示/告警:", file=out)
     for item in warnings:
         tone = str(item.get("tone", "info")).upper()
-        print(f"  [{tone}] {item.get('text', '')}")
+        print(f"  [{tone}] {item.get('text', '')}", file=out)
 
 
-def _print_steps(steps: list[dict[str, Any]]) -> None:
+def _print_steps(steps: list[dict[str, Any]], *, file: Any = None) -> None:
     if not steps:
         return
-    print("\n执行步骤:")
+    out = file or sys.stdout
+    print("\n执行步骤:", file=out)
     for step in steps:
         mark = "OK" if step.get("ok") else "FAIL"
         detail = step.get("detail", "")
         suffix = f" ({detail})" if detail else ""
-        print(f"  [{mark}] {step.get('name', '')}{suffix}")
+        print(f"  [{mark}] {step.get('name', '')}{suffix}", file=out)
         output = str(step.get("output", "")).strip()
         if not step.get("ok") and output:
-            print(f"       {output}")
+            print(f"       {output}", file=out)
 
 
-def _prompt(label: str, default: str = "") -> str:
+def _prompt(label: str, default: str = "", *, stream: Any = None) -> str:
+    out = stream or sys.stdout
     suffix = f" [{default}]" if default else ""
-    try:
-        answer = input(f"{label}{suffix}: ").strip()
-    except EOFError:
-        return default
+    print(f"{label}{suffix}: ", end="", flush=True, file=out)
+    answer = input().strip()
     return answer if answer else default
 
 
-def _prompt_bool(label: str, default: bool) -> bool:
+def _prompt_bool(label: str, default: bool, *, stream: Any = None) -> bool:
+    out = stream or sys.stdout
     hint = "Y/n" if default else "y/N"
     while True:
-        try:
-            answer = input(f"{label} [{hint}]: ").strip().lower()
-        except EOFError:
-            return default
+        print(f"{label} [{hint}]: ", end="", flush=True, file=out)
+        answer = input().strip().lower()
         if not answer:
             return default
         if answer in ("y", "yes", "1", "true"):
             return True
         if answer in ("n", "no", "0", "false"):
             return False
-        print("请输入 y 或 n。")
+        print("请输入 y 或 n。", file=out)
 
 
-def _prompt_choice(label: str, choices: list[str], default: str) -> str:
+def _prompt_choice(label: str, choices: list[str], default: str, *, stream: Any = None) -> str:
+    out = stream or sys.stdout
     opts = "/".join(choices)
     while True:
-        answer = _prompt(f"{label} ({opts})", default).lower()
+        answer = _prompt(f"{label} ({opts})", default, stream=out).lower()
         if answer in choices:
             return answer
-        print(f"无效选项，请从 {opts} 中选择。")
+        print(f"无效选项，请从 {opts} 中选择。", file=out)
 
 
 def run_wizard(repo_root: Path, args: argparse.Namespace) -> int:
+    json_mode = bool(getattr(args, "json", False))
+    ui_out = sys.stderr if json_mode else sys.stdout
+
     try:
         raw = _load_cli_values(args)
     except ValidationError as exc:
-        print(f"错误: {exc}", file=sys.stderr)
+        if json_mode:
+            print(json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False))
+        else:
+            print(f"错误: {exc}", file=sys.stderr)
         return 1
 
-    print("=" * 68)
-    print(" linkc-node Docker 命令行配置向导")
-    print("=" * 68)
-    print(f" 配置目录 : {raw['config_dir']}")
-    print(f" 数据目录 : {raw['data_dir']}")
-    print(f" 运行身份 : {'root' if os.geteuid() == 0 else f'UID {os.getuid()}:{os.getgid()}'}")
-    print("-" * 68)
+    print("=" * 68, file=ui_out)
+    print(" linkc-node Docker 命令行配置向导", file=ui_out)
+    print("=" * 68, file=ui_out)
+    print(f" 配置目录 : {raw['config_dir']}", file=ui_out)
+    print(f" 数据目录 : {raw['data_dir']}", file=ui_out)
+    print(f" 运行身份 : {'root' if os.geteuid() == 0 else f'UID {os.getuid()}:{os.getgid()}'}", file=ui_out)
+    print("-" * 68, file=ui_out)
 
     try:
-        raw["config_dir"] = _prompt("配置目录", str(raw["config_dir"]))
-        raw["data_dir"] = _prompt("数据目录", str(raw["data_dir"]))
-        raw["container_name"] = _prompt("容器名称", str(raw["container_name"]))
+        raw["config_dir"] = _as_abs_path(
+            _prompt("配置目录", str(raw["config_dir"]), stream=ui_out),
+            "config_dir",
+        )
+        raw["data_dir"] = _as_abs_path(
+            _prompt("数据目录", str(raw["data_dir"]), stream=ui_out),
+            "data_dir",
+        )
+        raw["container_name"] = _prompt("容器名称", str(raw["container_name"]), stream=ui_out)
 
-        existing = existing_state(normalize_values(
-            {
-                **raw,
-                "base_url": raw.get("base_url") or "https://panel.example.com",
-                "node_id": raw.get("node_id") or "1",
-                "api_key": raw.get("api_key") or "placeholder",
-            }
-        ))
+        existing = existing_state(
+            {"config_dir": raw["config_dir"], "data_dir": raw["data_dir"]}
+        )
 
-        raw["base_url"] = _prompt("面板地址 (https://...)", str(raw.get("base_url", "")))
+        raw["base_url"] = _prompt("面板地址 (https://...)", str(raw.get("base_url", "")), stream=ui_out)
         if raw["base_url"].lower().startswith("http://"):
-            raw["allow_http"] = _prompt_bool("检测到 http://，是否允许明文 HTTP（仅测试）", bool(raw.get("allow_http")))
+            raw["allow_http"] = _prompt_bool(
+                "检测到 http://，是否允许明文 HTTP（仅测试）",
+                bool(raw.get("allow_http")),
+                stream=ui_out,
+            )
         else:
             raw["allow_http"] = False
 
-        raw["node_id"] = _prompt("节点 ID", str(raw.get("node_id", "")))
+        raw["node_id"] = _prompt("节点 ID", str(raw.get("node_id", "")), stream=ui_out)
         if not raw.get("api_key"):
             key_hint = "面板 API Key (留空保留已有 api-key)" if existing["has_api_key"] else "面板 API Key"
             raw["api_key"] = getpass.getpass(f"{key_hint}: ").strip()
 
-        raw["listen"] = _prompt("监听地址", str(raw.get("listen", "0.0.0.0")))
+        raw["listen"] = _prompt("监听地址", str(raw.get("listen", "0.0.0.0")), stream=ui_out)
 
         cert_default = "keep" if existing["has_certs"] else "none"
         cert_choices = ["none", "files", "keep", "clear"] if existing["has_certs"] else ["none", "files"]
-        cert_mode = _prompt_choice("TLS 证书来源", cert_choices, cert_default)
+        cert_mode = _prompt_choice("TLS 证书来源", cert_choices, cert_default, stream=ui_out)
         if cert_mode == "files":
-            cert_path = _prompt("fullchain.pem 路径")
-            key_path = _prompt("privkey.pem 路径")
+            cert_path = _prompt("fullchain.pem 路径", stream=ui_out)
+            key_path = _prompt("privkey.pem 路径", stream=ui_out)
             raw["cert_pem"] = _read_text_input(cert_path, "证书文件")
             raw["key_pem"] = _read_text_input(key_path, "私钥文件")
             raw["clear_certs"] = False
@@ -2166,43 +2188,66 @@ def run_wizard(repo_root: Path, args: argparse.Namespace) -> int:
         has_dockerfile = (repo_root / "Dockerfile").is_file()
         img_default = "build" if raw.get("build_local") and has_dockerfile else ("pull" if raw.get("pull_latest", True) else "local")
         img_choices = ["pull", "build", "local"] if has_dockerfile else ["pull", "local"]
-        img_mode = _prompt_choice("镜像来源", img_choices, img_default)
+        img_mode = _prompt_choice("镜像来源", img_choices, img_default, stream=ui_out)
         raw["build_local"] = img_mode == "build"
         raw["pull_latest"] = img_mode == "pull"
-        raw["image"] = _prompt("Docker 镜像", str(raw.get("image", DEFAULT_IMAGE)))
+        default_img = str(raw.get("image") or DEFAULT_IMAGE)
+        if img_mode == "build" and default_img == DEFAULT_IMAGE:
+            default_img = "linkc-node:local"
+        elif img_mode == "pull" and default_img == "linkc-node:local":
+            default_img = DEFAULT_IMAGE
+        raw["image"] = _prompt("Docker 镜像", default_img, stream=ui_out)
 
-        raw["audit_enabled"] = _prompt_bool("启用审计", bool(raw.get("audit_enabled", True)))
+        raw["audit_enabled"] = _prompt_bool("启用审计", bool(raw.get("audit_enabled", True)), stream=ui_out)
         if raw["audit_enabled"]:
-            raw["audit_action"] = _prompt_choice("审计动作", ["report", "block"], str(raw.get("audit_action", "report")))
-        raw["limits_mode"] = _prompt_choice("限速/设备限制模式", ["enforce", "report", "off"], str(raw.get("limits_mode", "enforce")))
-        raw["allow_private_targets"] = _prompt_bool("允许代理访问内网目标（通常为 n）", bool(raw.get("allow_private_targets", False)))
-        raw["run_check"] = _prompt_bool("启动前执行 linkc-node check", bool(raw.get("run_check", True)))
+            raw["audit_action"] = _prompt_choice("审计动作", ["report", "block"], str(raw.get("audit_action", "report")), stream=ui_out)
+        raw["limits_mode"] = _prompt_choice("限速/设备限制模式", ["enforce", "report", "off"], str(raw.get("limits_mode", "enforce")), stream=ui_out)
+        raw["allow_private_targets"] = _prompt_bool("允许代理访问内网目标（通常为 n）", bool(raw.get("allow_private_targets", False)), stream=ui_out)
+        raw["run_check"] = _prompt_bool("启动前执行 linkc-node check", bool(raw.get("run_check", True)), stream=ui_out)
+
+        preview = preview_payload(raw, repo_root)
+        if not preview.get("ok"):
+            err_msg = preview.get("error", "未知错误")
+            if json_mode:
+                print(json.dumps({"ok": False, "error": err_msg}, ensure_ascii=False))
+            else:
+                print(f"\n校验失败: {err_msg}", file=sys.stderr)
+            return 1
+
+        _print_warnings(preview.get("warnings", []), file=ui_out)
+        print("\n--- 生成的 config.yaml ---", file=ui_out)
+        print(preview["config"], end="", file=ui_out)
+        print("\n--- Docker 启动命令 ---", file=ui_out)
+        print(preview["command"], file=ui_out)
+
+        action = _prompt_choice(
+            "下一步操作: deploy=部署启动, stage=仅生成配置, cancel=取消",
+            ["deploy", "stage", "cancel"],
+            "deploy",
+            stream=ui_out,
+        )
     except (KeyboardInterrupt, EOFError):
-        print("\n已取消。")
+        print("\n已取消。", file=ui_out)
+        if json_mode:
+            print(json.dumps({"ok": False, "cancelled": True, "error": "已取消"}, ensure_ascii=False))
         return 1
     except ValidationError as exc:
-        print(f"\n错误: {exc}", file=sys.stderr)
+        if json_mode:
+            print(json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False))
+        else:
+            print(f"\n错误: {exc}", file=sys.stderr)
         return 1
 
-    preview = preview_payload(raw, repo_root)
-    if not preview.get("ok"):
-        print(f"\n校验失败: {preview.get('error', '未知错误')}", file=sys.stderr)
-        return 1
-
-    _print_warnings(preview.get("warnings", []))
-    print("\n--- 生成的 config.yaml ---")
-    print(preview["config"], end="")
-    print("\n--- Docker 启动命令 ---")
-    print(preview["command"])
-
-    action = _prompt_choice("下一步操作: deploy=部署启动, stage=仅生成配置, cancel=取消", ["deploy", "stage", "cancel"], "deploy")
     if action == "cancel":
-        print("未修改任何文件或容器。")
+        if json_mode:
+            print(json.dumps({"ok": True, "action": "cancel", "cancelled": True}, ensure_ascii=False))
+        else:
+            print("未修改任何文件或容器。")
         return 0
 
     mode = "deploy" if action == "deploy" else "save"
     result = deploy(raw, repo_root, mode=mode)
-    if getattr(args, "json", False):
+    if json_mode:
         print(json.dumps(result, ensure_ascii=False, indent=2))
         return 0 if result.get("ok") else 1
     return _render_deploy_result(result)
@@ -2250,8 +2295,8 @@ def _add_value_flags(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--no-panel-tls-verify", dest="panel_tls_verify", action="store_false", default=None, help="disable panel TLS verification")
     parser.add_argument("--panel-timeout", default=None, help="panel HTTP timeout duration (e.g. 15s)")
     parser.add_argument("--max-attempts", type=int, default=None, help="panel HTTP max retry attempts (1..10)")
-    parser.add_argument("--max-response-mb", type=int, default=None, help="panel max response size MiB (1..256)")
-    parser.add_argument("--panel-proxy", default=None, help="HTTP/SOCKS5 proxy URL for panel requests")
+    parser.add_argument("--max-response-mb", type=int, default=None, help="panel max response size MiB (1..1024)")
+    parser.add_argument("--panel-proxy", default=None, help="HTTP(S)/SOCKS5 proxy URL for panel requests")
     parser.add_argument("--listen", default=None, help="node listen IP address (default: 0.0.0.0)")
     parser.add_argument("--cert-file", default=None, help="TLS fullchain PEM file to stage")
     parser.add_argument("--key-file", default=None, help="TLS private key PEM file to stage")
@@ -2260,7 +2305,7 @@ def _add_value_flags(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--no-audit-enabled", dest="audit_enabled", action="store_false", default=None, help="disable audit rules")
     parser.add_argument("--audit-action", choices=["report", "block"], default=None, help="audit action")
     parser.add_argument("--limits-mode", choices=["enforce", "report", "off"], default=None, help="speed/device limits mode")
-    parser.add_argument("--alive-ip-mode", choices=["changed", "full", "off"], default=None, help="alive_ip push mode")
+    parser.add_argument("--alive-ip-mode", choices=["changed", "full"], default=None, help="alive_ip push mode")
     parser.add_argument("--include-online-zero", dest="include_online_zero", action="store_true", default=None)
     parser.add_argument("--no-include-online-zero", dest="include_online_zero", action="store_false", default=None)
     parser.add_argument("--allow-private-targets", dest="allow_private_targets", action="store_true", default=None)
@@ -2294,8 +2339,8 @@ def _add_value_flags(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--no-metrics", dest="metrics", action="store_false", default=None)
     parser.add_argument("--pprof", dest="pprof", action="store_true", default=None)
     parser.add_argument("--no-pprof", dest="pprof", action="store_false", default=None)
-    parser.add_argument("--sniffing-mode", choices=["auto", "on", "off"], default=None)
-    parser.add_argument("--mass-remove-guard", choices=["warn", "reject", "off"], default=None)
+    parser.add_argument("--sniffing-mode", choices=["auto", "off"], default=None)
+    parser.add_argument("--mass-remove-guard", choices=["warn", "reject"], default=None)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -2461,23 +2506,27 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "logs":
         name = _resolve_container_name(args.container_name)
         if not _CONTAINER_RE.match(name):
-            print("错误: 容器名称不合法", file=sys.stderr)
+            if args.json:
+                print(json.dumps({"ok": False, "error": "容器名称不合法"}, ensure_ascii=False))
+            else:
+                print("错误: 容器名称不合法", file=sys.stderr)
             return 1
         if args.follow and args.json:
-            print("错误: --follow 不能与 --json 同时使用", file=sys.stderr)
+            print(json.dumps({"ok": False, "error": "--follow 不能与 --json 同时使用"}, ensure_ascii=False))
             return 1
+        tail = max(1, args.tail)
         if args.follow:
             proc = subprocess.run(
-                ["docker", "logs", "-f", "--tail", str(max(1, args.tail)), "--timestamps", name],
+                ["docker", "logs", "-f", "--tail", str(tail), "--timestamps", name],
                 check=False,
             )
             return proc.returncode
         if args.json:
-            res = action_payload("logs", {"container_name": name}, repo_root)
+            res = action_payload("logs", {"container_name": name, "tail": tail}, repo_root)
             print(json.dumps(res, ensure_ascii=False, indent=2))
             return 0 if res.get("ok") else 1
         result = run_cmd(
-            ["docker", "logs", "--tail", str(max(1, args.tail)), "--timestamps", name],
+            ["docker", "logs", "--tail", str(tail), "--timestamps", name],
             timeout=20,
         )
         if result["output"]:
@@ -2518,18 +2567,54 @@ def main(argv: list[str] | None = None) -> int:
             else:
                 print(f"错误: {exc}", file=sys.stderr)
             return 1
-        if args.json and args.command != "node-status":
-            print(
-                json.dumps(
-                    {"ok": status_code == 200, "status_code": status_code, "body": body},
-                    ensure_ascii=False,
-                    indent=2,
-                )
-            )
-            return 0 if status_code == 200 else 1
         if status_code != 200:
-            print(f"HTTP {status_code}: {body.strip()}", file=sys.stderr)
+            if args.json:
+                print(
+                    json.dumps(
+                        {
+                            "ok": False,
+                            "status_code": status_code,
+                            "error": body.strip() or f"HTTP {status_code}",
+                        },
+                        ensure_ascii=False,
+                        indent=2,
+                    )
+                )
+            else:
+                print(f"HTTP {status_code}: {body.strip()}", file=sys.stderr)
             return 1
+        if args.json:
+            if args.command == "node-status":
+                try:
+                    parsed = json.loads(body)
+                except json.JSONDecodeError as exc:
+                    print(
+                        json.dumps(
+                            {
+                                "ok": False,
+                                "status_code": status_code,
+                                "error": f"/status 返回了无效 JSON: {exc}",
+                                "body": body,
+                            },
+                            ensure_ascii=False,
+                            indent=2,
+                        )
+                    )
+                    return 1
+                if isinstance(parsed, dict):
+                    out = {"ok": True, **parsed}
+                else:
+                    out = {"ok": True, "status": parsed}
+                print(json.dumps(out, ensure_ascii=False, indent=2))
+            else:
+                print(
+                    json.dumps(
+                        {"ok": True, "status_code": status_code, "body": body},
+                        ensure_ascii=False,
+                        indent=2,
+                    )
+                )
+            return 0
         if args.command == "node-status":
             try:
                 parsed = json.loads(body)

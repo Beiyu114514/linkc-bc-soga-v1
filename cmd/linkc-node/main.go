@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -48,6 +49,12 @@ func run(args []string) error {
 	if err := fs.Parse(args[1:]); err != nil {
 		return err
 	}
+	cfgExplicit := false
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == "c" || f.Name == "config" {
+			cfgExplicit = true
+		}
+	})
 	switch cmd {
 	case "version":
 		fmt.Printf("linkc-node %s (commit %s, built %s)\n", version.Version, version.Commit, version.Date)
@@ -65,11 +72,11 @@ func run(args []string) error {
 	case "dump-config":
 		return dumpConfig(*cfgPath)
 	case "status":
-		return printAdminEndpoint(*cfgPath, *sockPath, "/status", true)
+		return printAdminEndpoint(*cfgPath, *sockPath, cfgExplicit, "/status", true)
 	case "metrics":
-		return printAdminEndpoint(*cfgPath, *sockPath, "/metrics", false)
+		return printAdminEndpoint(*cfgPath, *sockPath, cfgExplicit, "/metrics", false)
 	case "ready":
-		return printAdminEndpoint(*cfgPath, *sockPath, "/readyz", false)
+		return printAdminEndpoint(*cfgPath, *sockPath, cfgExplicit, "/readyz", false)
 	case "run":
 		return runAgent(*cfgPath)
 	case "help", "-h", "--help":
@@ -80,7 +87,7 @@ func run(args []string) error {
 }
 
 func usage() error {
-	fmt.Fprint(os.Stderr, `usage: linkc-node <run|check|dump-config|status|metrics|ready|version> [-c config.yaml]
+	fmt.Fprint(os.Stderr, `usage: linkc-node <run|check|dump-config|status|metrics|ready|version> [-c config.yaml] [-s socket]
 
   run          start the node agent
   check        validate local config and certificate files
@@ -93,18 +100,29 @@ func usage() error {
 	return nil
 }
 
-func resolveAdminSocket(cfgPath, sockPath string) string {
+func resolveAdminSocket(cfgPath, sockPath string, cfgExplicit bool) (string, error) {
 	if s := strings.TrimSpace(sockPath); s != "" {
-		return s
+		return s, nil
 	}
-	if cfg, err := config.Load(cfgPath); err == nil && strings.TrimSpace(cfg.Admin.Socket) != "" {
-		return cfg.Admin.Socket
+	cfg, err := config.Load(cfgPath)
+	if err != nil {
+		if !cfgExplicit && errors.Is(err, os.ErrNotExist) {
+			return "/run/linkc-node/admin.sock", nil
+		}
+		return "", fmt.Errorf("load config %s: %w", cfgPath, err)
 	}
-	return "/run/linkc-node/admin.sock"
+	if strings.TrimSpace(cfg.Admin.Socket) != "" {
+		return cfg.Admin.Socket, nil
+	}
+	return "/run/linkc-node/admin.sock", nil
 }
 
-func printAdminEndpoint(cfgPath, sockPath, endpoint string, prettyJSON bool) error {
-	body, err := queryAdmin(resolveAdminSocket(cfgPath, sockPath), endpoint)
+func printAdminEndpoint(cfgPath, sockPath string, cfgExplicit bool, endpoint string, prettyJSON bool) error {
+	resolvedSock, err := resolveAdminSocket(cfgPath, sockPath, cfgExplicit)
+	if err != nil {
+		return err
+	}
+	body, err := queryAdmin(resolvedSock, endpoint)
 	if err != nil {
 		return err
 	}

@@ -1,6 +1,6 @@
 # Docker 一键部署与管理（CLI）
 
-`scripts/docker-launch.sh` 是纯命令行部署与管理工具（不启动任何 Web 服务或端口）：通过交互式向导或子命令参数生成完整的 `config.yaml`、`api-key`（0600）、可选 TLS 证书和 `docker-run.sh`，并直接通过 Docker 编排容器生命周期及查询本地 Unix socket 管理接口。
+`scripts/docker-launch.sh` 是纯命令行部署与管理工具（不启动任何 Web 服务或端口）：通过交互式向导或子命令参数生成完整的 `config.yaml`、`api-key`（root 下 0640，非 root 下 0600）、可选 TLS 证书和 `docker-run.sh`，并直接通过 Docker 编排容器生命周期及查询本地 Unix socket 管理接口。
 
 适合第一次部署、自动化脚本批量部署以及不想手写 YAML 的场景。
 
@@ -97,10 +97,10 @@ sudo ./scripts/docker-launch.sh node-status
 sudo ./scripts/docker-launch.sh node-metrics
 ```
 
-也可直接用 `linkc-node` 二进制自身命令查询本地管理 socket：
+也可直接用 `linkc-node` 二进制自身命令查询宿主机暴露出的管理 socket（Docker 生成的 `config.yaml` 中 `admin.socket` 为容器内路径 `/run/linkc-node/admin.sock`，因此宿主机上请通过 `-s` 指定映射路径；非 root 默认位于 `~/.linkc-node/data/run/admin.sock`）：
 
 ```bash
-linkc-node status -c /etc/linkc-node/config.yaml
+linkc-node status -s /var/lib/linkc-node/run/admin.sock
 linkc-node metrics -s /var/lib/linkc-node/run/admin.sock
 linkc-node ready -s /var/lib/linkc-node/run/admin.sock
 ```

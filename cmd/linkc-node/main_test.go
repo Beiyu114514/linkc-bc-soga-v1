@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net"
 	"net/http"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -120,5 +121,52 @@ func TestQueryAdminUnixSocket(t *testing.T) {
 	}
 	if _, err := queryAdmin(sock, "/readyz"); err == nil {
 		t.Fatal("expected error when /readyz returns 503")
+	}
+}
+
+func TestResolveAdminSocket(t *testing.T) {
+	dir := t.TempDir()
+	cfgFile := filepath.Join(dir, "config.yaml")
+	cfgYAML := `panel:
+  base_url: "https://panel.example.com"
+  api_key: "secret"
+  node_id: "1"
+admin:
+  socket: "` + filepath.Join(dir, "custom.sock") + `"
+`
+	if err := os.WriteFile(cfgFile, []byte(cfgYAML), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	badFile := filepath.Join(dir, "bad.yaml")
+	if err := os.WriteFile(badFile, []byte("panel:\n  node_id: ["), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// Explicit -s overrides config loading.
+	sock, err := resolveAdminSocket(filepath.Join(dir, "missing.yaml"), "/tmp/explicit.sock", true)
+	if err != nil || sock != "/tmp/explicit.sock" {
+		t.Fatalf("explicit -s got (%q, %v), want /tmp/explicit.sock", sock, err)
+	}
+
+	// Missing default config falls back to /run/linkc-node/admin.sock.
+	sock, err = resolveAdminSocket(filepath.Join(dir, "missing.yaml"), "", false)
+	if err != nil || sock != "/run/linkc-node/admin.sock" {
+		t.Fatalf("default missing cfg got (%q, %v), want default socket", sock, err)
+	}
+
+	// Missing explicit -c returns an error instead of silently falling back.
+	if _, err := resolveAdminSocket(filepath.Join(dir, "missing.yaml"), "", true); err == nil {
+		t.Fatal("expected error for missing explicit -c config")
+	}
+
+	// Malformed config returns an error even when -c was not explicit.
+	if _, err := resolveAdminSocket(badFile, "", false); err == nil {
+		t.Fatal("expected error for malformed config")
+	}
+
+	// Valid config supplies admin.socket.
+	sock, err = resolveAdminSocket(cfgFile, "", true)
+	if err != nil || sock != filepath.Join(dir, "custom.sock") {
+		t.Fatalf("valid cfg got (%q, %v), want %q", sock, err, filepath.Join(dir, "custom.sock"))
 	}
 }

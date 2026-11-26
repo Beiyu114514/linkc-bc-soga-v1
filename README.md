@@ -89,7 +89,7 @@ sudo ./scripts/docker-launch.sh logs -f
 ```
 
 `scripts/docker-launch.sh` 是纯命令行部署与管理工具（不启动任何 Web 服务或端口），按参数自动生成
-`config.yaml`、`api-key`（0600）、可选证书与 `docker-run.sh` 并启动容器。非 root 下默认写入
+`config.yaml`、`api-key`（root 下 0640，非 root 下 0600）、可选证书与 `docker-run.sh` 并启动容器。非 root 下默认写入
 `~/.linkc-node`。详细说明见 [docs/docker-launcher.md](./docs/docker-launcher.md)。
 
 ## 快速检查 / 运行
