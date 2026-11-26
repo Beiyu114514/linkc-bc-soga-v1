@@ -6,11 +6,16 @@ Run with:  python3 -m unittest discover -s scripts -p 'test_*.py' -v
 
 from __future__ import annotations
 
-import hashlib
+import contextlib
 import importlib.util
+import io
+import json
+import os
+import socket
 import tempfile
 import threading
 import unittest
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from unittest import mock
 
@@ -39,49 +44,6 @@ def values_with(tmp: Path, **overrides):
     raw["data_dir"] = str(tmp / "data")
     raw.update(overrides)
     return raw
-
-
-class FakeHeaders(dict):
-    def get(self, key, default=None):
-        return dict.get(self, key, default)
-
-
-class FakeServer:
-    def __init__(self, **overrides):
-        self.token = "tok"
-        self.username = ""
-        self.password = ""
-        self.password_hash = None
-        self.auth_cache = set()
-        self.auth_cache_key = b"k" * 32
-        self.auth_lock = threading.Lock()
-        self.auth_failures = {}
-        self.auth_verify_slots = threading.BoundedSemaphore(dl.AUTH_MAX_CONCURRENT_VERIFY)
-        for key, value in overrides.items():
-            setattr(self, key, value)
-
-
-def make_handler(*, path="/", headers=None, server=None, client=("127.0.0.1", 1234)):
-    handler = object.__new__(dl.Handler)
-    handler.path = path
-    handler.headers = FakeHeaders(headers or {})
-    handler.client_address = client
-    handler.server = server or FakeServer()
-    handler.close_connection = False
-    handler.responses = []
-
-    def send_bytes(status, body, content_type, extra_headers=None):
-        handler.responses.append((status, body))
-
-    handler._send_bytes = send_bytes
-    return handler
-
-
-def basic(user: str, password: str) -> str:
-    import base64
-
-    token = base64.b64encode(f"{user}:{password}".encode("utf-8")).decode("ascii")
-    return f"Basic {token}"
 
 
 class NormalizeValuesTest(unittest.TestCase):
@@ -269,11 +231,20 @@ class EnsureOwnedDirTest(unittest.TestCase):
             paths = dl.prepare_files(values, {"has_api_key": False, "has_certs": False}, Path("/repo"))
         config_path = Path(paths["config_path"])
         api_key_path = Path(paths["api_key_path"])
-        self.assertEqual(config_path.stat().st_mode & 0o777, 0o600)
-        self.assertEqual(api_key_path.stat().st_mode & 0o777, 0o600)
+        run_script_path = Path(paths["run_script_path"])
+        expected_cfg_mode = 0o640 if os.geteuid() == 0 else 0o600
+        expected_run_mode = 0o700 if os.geteuid() == 0 else 0o755
+        self.assertEqual(config_path.stat().st_mode & 0o777, expected_cfg_mode)
+        self.assertEqual(api_key_path.stat().st_mode & 0o777, expected_cfg_mode)
+        self.assertEqual(run_script_path.stat().st_mode & 0o777, expected_run_mode)
+        if os.geteuid() == 0:
+            self.assertEqual(config_path.stat().st_uid, 0)
+            self.assertEqual(config_path.stat().st_gid, 10001)
+            self.assertEqual(run_script_path.stat().st_uid, 0)
+            self.assertEqual(run_script_path.stat().st_gid, 0)
         self.assertEqual(api_key_path.read_text().strip(), "secret-key")
         self.assertNotIn("secret-key", config_path.read_text())
-        self.assertTrue(Path(paths["run_script_path"]).is_file())
+        self.assertTrue(run_script_path.is_file())
 
 
 class StageConfigTest(unittest.TestCase):
@@ -321,110 +292,141 @@ class WaitContainerStartTest(unittest.TestCase):
         self.assertFalse(ok)
 
 
-class HandlerSecurityTest(unittest.TestCase):
-    def test_host_check_allows_ip_and_localhost(self):
-        for host in ("127.0.0.1:8080", "192.168.1.10:8080", "localhost:8080", "[::1]:8080"):
-            with self.subTest(host=host):
-                handler = make_handler(headers={"Host": host})
-                self.assertTrue(handler._host_ok())
-
-    def test_host_check_rejects_dns_names(self):
-        handler = make_handler(headers={"Host": "evil.example.com"})
-        self.assertFalse(handler._host_ok())
-
-    def test_origin_check(self):
-        handler = make_handler(headers={"Host": "127.0.0.1:8080"})
-        self.assertTrue(handler._origin_ok())
-        handler = make_handler(
-            headers={"Host": "127.0.0.1:8080", "Origin": "http://evil.example.com"}
-        )
-        self.assertFalse(handler._origin_ok())
-
-    def test_token_check(self):
-        handler = make_handler(path="/?token=tok")
-        self.assertTrue(handler._token_ok())
-        handler = make_handler(path="/?token=nope")
-        self.assertFalse(handler._token_ok())
-        handler = make_handler(headers={"X-Launcher-Token": "tok"})
-        self.assertTrue(handler._token_ok())
-
-    def test_auth_disabled_accepts(self):
-        handler = make_handler()
-        self.assertTrue(handler._check_auth())
-        self.assertEqual(handler.responses, [])
-
-    def test_auth_requires_credentials(self):
-        server = FakeServer(username="admin", password="pw")
-        handler = make_handler(server=server)
-        self.assertFalse(handler._check_auth())
-        self.assertEqual(handler.responses[-1][0], 401)
-
-        handler = make_handler(server=server, headers={"Authorization": basic("admin", "pw")})
-        self.assertTrue(handler._check_auth())
-
-        handler = make_handler(server=server, headers={"Authorization": basic("admin", "bad")})
-        self.assertFalse(handler._check_auth())
-
-    def test_auth_rate_limit(self):
-        server = FakeServer(username="admin", password="pw")
-        for _ in range(dl.AUTH_MAX_FAILURES):
-            handler = make_handler(server=server, headers={"Authorization": basic("admin", "bad")})
-            self.assertFalse(handler._check_auth())
-            self.assertEqual(handler.responses[-1][0], 401)
-        handler = make_handler(server=server, headers={"Authorization": basic("admin", "bad")})
-        self.assertFalse(handler._check_auth())
-        self.assertEqual(handler.responses[-1][0], 429)
-
-    def test_auth_with_scrypt_hash(self):
-        salt = b"s" * 16
-        digest = hashlib.scrypt(
-            b"pw", salt=salt, n=1024, r=8, p=1, dklen=32, maxmem=dl.SCRYPT_MAXMEM
-        )
-        password_hash = dl.PasswordHash(1024, 8, 1, salt, digest)
-        server = FakeServer(username="admin", password_hash=password_hash)
-        handler = make_handler(server=server, headers={"Authorization": basic("admin", "pw")})
-        self.assertTrue(handler._check_auth())
-        handler = make_handler(server=server, headers={"Authorization": basic("admin", "bad")})
-        self.assertFalse(handler._check_auth())
-
-
-class PasswordHashFileTest(unittest.TestCase):
+class CliAndUnixSocketTest(unittest.TestCase):
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp())
 
-    def test_reads_one_line_format(self):
-        salt = b"saltsalt"
-        digest = hashlib.scrypt(b"pw", salt=salt, n=1024, r=8, p=1, dklen=32, maxmem=dl.SCRYPT_MAXMEM)
-        import base64
+    def test_preview_and_stage_cli(self):
+        cfg_dir = self.tmp / "etc"
+        data_dir = self.tmp / "data"
+        buf = io.StringIO()
+        with mock.patch.dict(os.environ, {"TEST_PANEL_KEY": "env-secret-key"}), \
+             mock.patch.object(dl, "last_config_dir_path", lambda: self.tmp / "last"), \
+             mock.patch.object(dl, "docker_state", lambda: {"ok": False, "error": "no docker"}), \
+             contextlib.redirect_stdout(buf):
+            rc = dl.main([
+                "preview",
+                "--fresh",
+                "--panel-url", "https://panel.example.com",
+                "--node-id", "42",
+                "--api-key-env", "TEST_PANEL_KEY",
+                "--config-dir", str(cfg_dir),
+                "--data-dir", str(data_dir),
+                "--json",
+            ])
+        self.assertEqual(rc, 0)
+        out = json.loads(buf.getvalue())
+        self.assertTrue(out["ok"])
+        self.assertIn("42", out["config"])
+        self.assertNotIn("env-secret-key", out["config"])
+        self.assertFalse(cfg_dir.exists())
 
-        line = "scrypt$1024$8$1${}${}".format(
-            base64.b64encode(salt).decode(), base64.b64encode(digest).decode()
-        )
-        path = self.tmp / "password.hash"
-        path.write_text(line + "\n")
-        parsed = dl.load_password_hash(path)
-        self.assertTrue(parsed.verify("pw"))
-        self.assertFalse(parsed.verify("nope"))
+        buf = io.StringIO()
+        with mock.patch.dict(os.environ, {"TEST_PANEL_KEY": "env-secret-key"}), \
+             mock.patch.object(dl, "last_config_dir_path", lambda: self.tmp / "last"), \
+             mock.patch.object(dl, "docker_state", lambda: {"ok": False, "error": "no docker"}), \
+             contextlib.redirect_stdout(buf):
+            rc = dl.main([
+                "stage",
+                "--fresh",
+                "--panel-url", "https://panel.example.com",
+                "--node-id", "42",
+                "--api-key-env", "TEST_PANEL_KEY",
+                "--config-dir", str(cfg_dir),
+                "--data-dir", str(data_dir),
+                "--json",
+            ])
+        self.assertEqual(rc, 0)
+        staged = json.loads(buf.getvalue())
+        self.assertTrue(staged["ok"])
+        self.assertEqual((cfg_dir / "api-key").read_text().strip(), "env-secret-key")
+        self.assertTrue((cfg_dir / "config.yaml").is_file())
+        self.assertTrue((cfg_dir / "docker-run.sh").is_file())
 
-    def test_rejects_bad_params(self):
-        import base64
+    def test_deploy_dry_run_and_config_json(self):
+        cfg_json = self.tmp / "opts.json"
+        cfg_json.write_text(json.dumps({
+            "base_url": "https://panel.example.com",
+            "node_id": "7",
+            "api_key": "json-key",
+            "config_dir": str(self.tmp / "etc"),
+            "data_dir": str(self.tmp / "data"),
+            "listen": "localhost",
+        }))
+        buf = io.StringIO()
+        with mock.patch.object(dl, "last_config_dir_path", lambda: self.tmp / "last"), \
+             mock.patch.object(dl, "docker_state", lambda: {"ok": False, "error": "no docker"}), \
+             contextlib.redirect_stdout(buf):
+            rc = dl.main(["deploy", "--fresh", "--config-json", str(cfg_json), "--dry-run", "--json"])
+        self.assertEqual(rc, 0)
+        out = json.loads(buf.getvalue())
+        self.assertTrue(out["ok"])
+        self.assertIn('listen: "127.0.0.1"', out["config"])
+        self.assertFalse((self.tmp / "etc" / "config.yaml").exists())
 
-        line = "scrypt$3$8$1${}${}".format(
-            base64.b64encode(b"saltsalt").decode(),
-            base64.b64encode(b"x" * 32).decode(),
-        )
-        path = self.tmp / "password.hash"
-        path.write_text(line)
-        with self.assertRaises(dl.ValidationError):
-            dl.load_password_hash(path)
+    def test_cert_file_mismatch_and_status_cli(self):
+        cert = self.tmp / "cert.pem"
+        cert.write_text("CERT")
+        err_buf = io.StringIO()
+        with mock.patch.object(dl, "last_config_dir_path", lambda: self.tmp / "last"), \
+             contextlib.redirect_stderr(err_buf):
+            rc = dl.main(["preview", "--fresh", "--cert-file", str(cert)])
+        self.assertEqual(rc, 1)
+        self.assertIn("--cert-file", err_buf.getvalue())
 
+        buf = io.StringIO()
+        with mock.patch.object(dl, "last_config_dir_path", lambda: self.tmp / "last"), \
+             mock.patch.object(dl, "docker_state", lambda: {"ok": False, "error": "no docker"}), \
+             contextlib.redirect_stdout(buf):
+            rc = dl.main(["status", "--config-dir", str(self.tmp / "etc"), "--json"])
+        self.assertEqual(rc, 0)
+        st = json.loads(buf.getvalue())
+        self.assertTrue(st["ok"])
+        self.assertNotIn("auth_enabled", st)
 
-class DetectLanIpTest(unittest.TestCase):
-    def test_never_returns_loopback(self):
-        ip = dl.detect_lan_ip()
-        self.assertIsInstance(ip, str)
-        self.assertFalse(ip.startswith("127."))
-        self.assertNotEqual(ip, "0.0.0.0")
+    def test_node_status_unix_socket_cli(self):
+        sock_path = str(self.tmp / "admin.sock")
+
+        class _UnixServer(HTTPServer):
+            address_family = socket.AF_UNIX
+
+        class _Handler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                if self.path == "/status":
+                    body = b'{"ready":true,"users":5}'
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                else:
+                    body = b"not ready\n"
+                    self.send_response(503)
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+
+            def log_message(self, fmt, *args):
+                del fmt, args
+
+        srv = _UnixServer(sock_path, _Handler)
+        thread = threading.Thread(target=srv.serve_forever, daemon=True)
+        thread.start()
+        try:
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = dl.main(["node-status", "-s", sock_path])
+            self.assertEqual(rc, 0)
+            self.assertEqual(json.loads(buf.getvalue()), {"ready": True, "users": 5})
+
+            err_buf = io.StringIO()
+            with contextlib.redirect_stderr(err_buf):
+                rc = dl.main(["node-ready", "-s", sock_path])
+            self.assertEqual(rc, 1)
+            self.assertIn("503", err_buf.getvalue())
+        finally:
+            srv.shutdown()
+            srv.server_close()
 
 
 class RestoreBackupFilesTest(unittest.TestCase):
@@ -468,8 +470,13 @@ class RestoreBackupFilesTest(unittest.TestCase):
             (self.config_dir / "certs" / "fullchain.pem").read_text(), "CERT\n"
         )
         self.assertEqual((self.config_dir / "certs" / "privkey.pem").read_text(), "KEY\n")
-        self.assertEqual((self.config_dir / "config.yaml").stat().st_mode & 0o777, 0o600)
-        self.assertEqual((self.config_dir / "docker-run.sh").stat().st_mode & 0o777, 0o755)
+        expected_cfg_mode = 0o640 if os.geteuid() == 0 else 0o600
+        expected_run_mode = 0o700 if os.geteuid() == 0 else 0o755
+        self.assertEqual((self.config_dir / "config.yaml").stat().st_mode & 0o777, expected_cfg_mode)
+        self.assertEqual((self.config_dir / "docker-run.sh").stat().st_mode & 0o777, expected_run_mode)
+        if os.geteuid() == 0:
+            self.assertEqual((self.config_dir / "docker-run.sh").stat().st_uid, 0)
+            self.assertEqual((self.config_dir / "docker-run.sh").stat().st_gid, 0)
 
     def test_removes_files_that_did_not_exist_before(self):
         (self.backup / "whitelist.txt").unlink()
@@ -555,6 +562,39 @@ class ReplaceContainerRollbackTest(unittest.TestCase):
         self.assertIn("回滚启动旧容器", names)
         self.assertLess(names.index("恢复旧配置"), names.index("回滚容器名"))
         self.assertLess(names.index("回滚容器名"), names.index("回滚启动旧容器"))
+
+
+class SecurityHardeningTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+
+    def test_ensure_owned_dir_rejects_symlinks(self):
+        real = self.tmp / "real"
+        real.mkdir()
+        link = self.tmp / "link"
+        link.symlink_to(real)
+        with self.assertRaises(dl.ValidationError):
+            dl.ensure_owned_dir(link, dl.CONFIG_DIR_ALLOWED, "配置目录")
+
+        parent = self.tmp / "dir"
+        parent.mkdir()
+        (parent / "config.yaml").symlink_to(self.tmp / "elsewhere")
+        with self.assertRaises(dl.ValidationError):
+            dl.ensure_owned_dir(parent, dl.CONFIG_DIR_ALLOWED, "配置目录")
+
+    def test_rejects_colon_in_mount_paths(self):
+        raw = values_with(self.tmp)
+        raw["config_dir"] = str(self.tmp / "etc:evil")
+        with self.assertRaises(dl.ValidationError):
+            dl.normalize_values(raw)
+        with self.assertRaises(dl.ValidationError):
+            dl.volume_arg("/tmp/a:b", "/etc/linkc-node", read_only=True, values={"selinux_relabel": False})
+
+    def test_localhost_listen_normalizes_to_loopback_ip(self):
+        raw = values_with(self.tmp)
+        raw["listen"] = "localhost"
+        values = dl.normalize_values(raw)
+        self.assertEqual(values["listen"], "127.0.0.1")
 
 
 if __name__ == "__main__":

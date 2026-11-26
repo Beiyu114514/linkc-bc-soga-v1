@@ -2,6 +2,9 @@ package main
 
 import (
 	"encoding/json"
+	"net"
+	"net/http"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -61,5 +64,61 @@ func TestRedactSnakeCase(t *testing.T) {
 		if _, ok := val.([]any); ok {
 			t.Fatalf("%s not redacted: %v", k, val)
 		}
+	}
+}
+
+func TestRedactVLESSDecryption(t *testing.T) {
+	v := map[string]any{
+		"inbounds": []any{
+			map[string]any{
+				"settings": map[string]any{
+					"decryption": "mlkem768x25519plus.native.0rtt.SECRETKEY",
+				},
+			},
+			map[string]any{
+				"settings": map[string]any{
+					"decryption": "none",
+				},
+			},
+		},
+	}
+	redact(v)
+	inbounds := v["inbounds"].([]any)
+	s0 := inbounds[0].(map[string]any)["settings"].(map[string]any)["decryption"]
+	s1 := inbounds[1].(map[string]any)["settings"].(map[string]any)["decryption"]
+	if s0 != "***" {
+		t.Fatalf("non-none decryption must be redacted, got %v", s0)
+	}
+	if s1 != "none" {
+		t.Fatalf("decryption=none should stay visible, got %v", s1)
+	}
+}
+
+func TestQueryAdminUnixSocket(t *testing.T) {
+	sock := filepath.Join(t.TempDir(), "admin.sock")
+	ln, err := net.Listen("unix", sock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mux := http.NewServeMux()
+	mux.HandleFunc("/status", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"ready":true,"users":3}`))
+	})
+	mux.HandleFunc("/readyz", func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "not ready", http.StatusServiceUnavailable)
+	})
+	srv := &http.Server{Handler: mux}
+	go func() { _ = srv.Serve(ln) }()
+	defer srv.Close()
+
+	body, err := queryAdmin(sock, "/status")
+	if err != nil {
+		t.Fatalf("queryAdmin(/status) failed: %v", err)
+	}
+	if !strings.Contains(string(body), `"users":3`) {
+		t.Fatalf("unexpected /status body: %s", body)
+	}
+	if _, err := queryAdmin(sock, "/readyz"); err == nil {
+		t.Fatal("expected error when /readyz returns 503")
 	}
 }

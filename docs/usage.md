@@ -199,6 +199,10 @@ sudo systemctl enable --now linkc-node@node2
 ## 6. 管理面与监控
 
 ```bash
+linkc-node status -c /etc/linkc-node/config.yaml
+linkc-node metrics -c /etc/linkc-node/config.yaml
+linkc-node ready -c /etc/linkc-node/config.yaml
+# 或直接通过 curl 查询 Unix socket
 curl --unix-socket /run/linkc-node/admin.sock http://localhost/status
 curl --unix-socket /run/linkc-node/admin.sock http://localhost/metrics
 ```

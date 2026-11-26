@@ -39,23 +39,25 @@ journalctl -u linkc-node -f
 
 ## Docker
 
-图形化一键启动（推荐首次使用）：
+命令行一键部署（推荐首次使用）：
 
 ```bash
-# 默认监听 0.0.0.0；自动生成并打印页面密码，写入 0600 JSON 凭据文件
-sudo ./scripts/docker-launch.sh --username admin
+# 交互式向导
+sudo ./scripts/docker-launch.sh wizard
 
-# 仅本机访问
-sudo ./scripts/docker-launch.sh --bind 127.0.0.1
+# 或非交互式一键部署
+sudo env PANEL_API_KEY="$PANEL_API_KEY" ./scripts/docker-launch.sh deploy \
+  --panel-url https://panel.example.com \
+  --node-id 12 \
+  --api-key-env PANEL_API_KEY
 
-# 用哈希文件（可选，不保存明文）
-sudo ./scripts/docker-launch.sh --hash-password --hash-password-output /root/.linkc-node/password.hash
-sudo ./scripts/docker-launch.sh --username admin --password-hash-file /root/.linkc-node/password.hash
+# 查看状态、日志与节点管理接口
+sudo ./scripts/docker-launch.sh status
+sudo ./scripts/docker-launch.sh node-status
+sudo ./scripts/docker-launch.sh logs -f
 ```
 
-页面会生成配置、API Key 文件、可选证书和 `docker-run.sh`，然后启动容器。默认监听
-`0.0.0.0`；非回环监听必须用 `--username` 启用登录，否则拒绝启动。仅本机用
-`--bind 127.0.0.1`。详见
+`docker-launch.sh` 为纯命令行部署与管理工具（无 Web 页面），会自动生成配置、API Key 文件、可选证书和 `docker-run.sh`。详见
 [docker-launcher.md](./docker-launcher.md)。
 
 手动方式：

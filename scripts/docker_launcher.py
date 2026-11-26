@@ -1,31 +1,17 @@
 #!/usr/bin/env python3
 """
-Local-only web UI for launching linkc-node in Docker.
+CLI tool for deploying and managing linkc-node in Docker.
 
 The launcher writes a complete config.yaml, an api-key file (0600), optional
-TLS certificates, and a reproducible docker-run.sh, then starts the container
-with host networking.  It only uses the Python standard library.
-
-Security model:
-  * binds to 0.0.0.0 by default; non-loopback binds require --username, and the
-    page is plain HTTP, so keep it behind a firewall or an SSH tunnel;
-  * every request needs a random token (in the URL for the page, in the
-    X-Launcher-Token header for API calls);
-  * Host/Origin checks block DNS-rebinding and cross-site POSTs;
-  * failed logins are rate limited per client address and password hashing is
-    capped to a few concurrent verifications;
-  * secrets are never returned by the API, never put in the docker command,
-    and never written to launcher.json.
+TLS certificates, and a reproducible docker-run.sh, then deploys or manages
+the container with host networking.  It only uses the Python standard library.
 """
 
 from __future__ import annotations
 
 import argparse
-import base64
 import datetime as dt
 import getpass
-import hashlib
-import hmac
 import ipaddress
 import json
 import os
@@ -33,21 +19,17 @@ import re
 import secrets
 import shlex
 import shutil
-import signal
 import socket
 import subprocess
 import sys
 import tempfile
-import threading
 import time
 import traceback
 import urllib.parse
-import webbrowser
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
-LAUNCHER_VERSION = "1.0.0"
+LAUNCHER_VERSION = "2.0.0"
 
 CONFIG_FILENAME = "config.yaml"
 API_KEY_FILENAME = "api-key"
@@ -69,20 +51,6 @@ CONTAINER_GEODATA_PATH = "/usr/share/xray"
 DEFAULT_IMAGE = "ghcr.io/beiyu114514/linkc-bc-soga-v1:latest"
 DEFAULT_CONTAINER = "linkc-node"
 DEFAULT_PROFILE = "sspanel-uim-soga"
-
-CSP = (
-    "default-src 'none'; "
-    "style-src 'unsafe-inline'; "
-    "script-src 'unsafe-inline'; "
-    "img-src data:; "
-    "connect-src 'self'; "
-    "form-action 'none'; "
-    "base-uri 'none'; "
-    "frame-ancestors 'none'"
-)
-
-HASH_FILE_MAX_BYTES = 64 * 1024
-SCRYPT_MAXMEM = 256 * 1024 * 1024
 
 _DURATION_RE = re.compile(r"^(?:\d+(?:\.\d+)?(?:ns|us|µs|ms|s|m|h))+$")
 _DURATION_PART_RE = re.compile(r"(\d+(?:\.\d+)?)(ns|us|µs|ms|s|m|h)")
@@ -118,12 +86,6 @@ DATA_DIR_ALLOWED = {"state.db", "state.db.bak", "state.db.lock", "run"}
 CERTS_DIR_ALLOWED = {"fullchain.pem", "privkey.pem"}
 RUN_DIR_ALLOWED = {"admin.sock"}
 
-# Failed-login throttling for HTTP Basic Auth.
-AUTH_MAX_FAILURES = 10
-AUTH_FAILURE_WINDOW = 60.0
-AUTH_MAX_CONCURRENT_VERIFY = 4
-AUTH_VERIFY_TIMEOUT = 5.0
-
 METADATA_KEYS = [
     "base_url", "node_id", "profile", "allow_http", "panel_tls_verify",
     "panel_timeout", "max_attempts", "max_response_mb", "panel_proxy",
@@ -148,29 +110,6 @@ class DeploymentError(RuntimeError):
     def __init__(self, message: str, steps: list[dict[str, Any]] | None = None):
         super().__init__(message)
         self.steps = steps or []
-
-
-class PasswordHash:
-    """A scrypt password hash loaded from a JSON or one-line file."""
-
-    def __init__(self, n: int, r: int, p: int, salt: bytes, digest: bytes):
-        self.n = n
-        self.r = r
-        self.p = p
-        self.salt = salt
-        self.digest = digest
-
-    def verify(self, password: str) -> bool:
-        candidate = hashlib.scrypt(
-            password.encode("utf-8"),
-            salt=self.salt,
-            n=self.n,
-            r=self.r,
-            p=self.p,
-            dklen=len(self.digest),
-            maxmem=SCRYPT_MAXMEM,
-        )
-        return hmac.compare_digest(candidate, self.digest)
 
 
 # ---------------------------------------------------------------------------
@@ -313,6 +252,8 @@ def _as_abs_path(value: Any, key: str) -> str:
         raise ValidationError(f"{key} 包含控制字符")
     if ".." in Path(text).parts:
         raise ValidationError(f"{key} 不能包含 ..")
+    if ":" in text:
+        raise ValidationError(f"{key} 不能包含冒号 (:)")
     normalized = os.path.normpath(text)
     if normalized in _BLOCKED_DIRS:
         raise ValidationError(f"{key} 不能是系统目录 {normalized}")
@@ -441,7 +382,9 @@ def normalize_values(raw: Any) -> dict[str, Any]:
 
     if not values["listen"]:
         values["listen"] = "0.0.0.0"
-    if values["listen"] != "localhost":
+    if values["listen"] == "localhost":
+        values["listen"] = "127.0.0.1"
+    else:
         try:
             ipaddress.ip_address(values["listen"])
         except ValueError:
@@ -647,6 +590,8 @@ def build_config(values: dict[str, Any], existing: dict[str, Any]) -> str:
 
 
 def volume_arg(host: str, container: str, *, read_only: bool, values: dict[str, Any]) -> str:
+    if ":" in host or ":" in container:
+        raise ValidationError("挂载路径不能包含冒号 (:)")
     options = "ro" if read_only else ""
     if values["selinux_relabel"]:
         options = (options + ",z").lstrip(",")
@@ -691,6 +636,8 @@ def docker_run_command(values: dict[str, Any], existing: dict[str, Any], *, chec
         if values["geodata_dir"]:
             # Do not add :z here: relabelling a shared system geodata directory
             # can affect other services.  The UI warns about SELinux instead.
+            if ":" in values["geodata_dir"]:
+                raise ValidationError("geodata_dir 不能包含冒号 (:)")
             command += ["-v", f"{values['geodata_dir']}:{CONTAINER_GEODATA_PATH}:ro"]
 
     command.append(values["image"])
@@ -807,203 +754,26 @@ def write_last_config_dir(config_dir: str) -> None:
         pass
 
 
-def default_credentials_path() -> Path:
-    return Path.home() / ".linkc-node" / "launcher-credentials.json"
-
-
-def write_credentials_file(
-    path: Path,
-    *,
-    url: str,
-    lan_url: str,
-    username: str,
-    password: str,
-    listen: str,
-    port: int,
-) -> None:
-    payload: dict[str, Any] = {
-        "generated_at": utcnow(),
-        "listen": listen,
-        "port": port,
-        "url": url,
-    }
-    if lan_url:
-        payload["lan_url"] = lan_url
-    payload["username"] = username
-    payload["password"] = password
-    atomic_write(
-        path,
-        json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
-        0o600,
-    )
-    if path.parent == Path.home() / ".linkc-node":
-        try:
-            os.chmod(path.parent, 0o700)
-        except OSError:
-            pass
-
-
-def _validate_scrypt_params(n: int, r: int, p: int, salt: bytes, digest: bytes) -> None:
-    if n < 2**10 or n > 2**17 or (n & (n - 1)) != 0:
-        raise ValidationError("scrypt n 必须是 1024..131072 之间的 2 的幂")
-    if r < 1 or r > 16:
-        raise ValidationError("scrypt r 必须在 1..16 之间")
-    if p < 1 or p > 8:
-        raise ValidationError("scrypt p 必须在 1..8 之间")
-    if n * r > 2**20:
-        raise ValidationError("scrypt n*r 过大（上限 1048576）")
-    if len(salt) < 8 or len(salt) > 64:
-        raise ValidationError("scrypt salt 长度必须在 8..64 字节")
-    if len(digest) < 16 or len(digest) > 64:
-        raise ValidationError("scrypt hash 长度必须在 16..64 字节")
-
-
-def _b64decode(value: str, field: str) -> bytes:
-    try:
-        return base64.b64decode(value, validate=True)
-    except (ValueError, TypeError) as exc:
-        raise ValidationError(f"{field} 不是合法 base64: {exc}")
-
-
-def load_password_hash(path: Path) -> PasswordHash:
-    try:
-        if path.stat().st_size > HASH_FILE_MAX_BYTES:
-            raise ValidationError(f"密码哈希文件过大: {path}")
-        text = path.read_text(encoding="utf-8-sig").strip()
-    except (OSError, UnicodeDecodeError) as exc:
-        raise ValidationError(f"读取密码哈希文件失败 {path}: {exc}")
-    if not text:
-        raise ValidationError(f"密码哈希文件为空: {path}")
-
-    if text.startswith("{"):
-        try:
-            data = json.loads(text)
-        except json.JSONDecodeError as exc:
-            raise ValidationError(f"密码哈希 JSON 解析失败: {exc}")
-        if not isinstance(data, dict):
-            raise ValidationError("密码哈希 JSON 必须是对象")
-        if str(data.get("algorithm", "")).lower() != "scrypt":
-            raise ValidationError("密码哈希 algorithm 只支持 scrypt")
-        try:
-            n = int(data["n"])
-            r = int(data["r"])
-            p = int(data["p"])
-        except (KeyError, TypeError, ValueError):
-            raise ValidationError("密码哈希 JSON 需要整数 n/r/p")
-        salt = _b64decode(str(data.get("salt", "")), "salt")
-        digest_b64 = data.get("hash") or data.get("digest") or ""
-        digest = _b64decode(str(digest_b64), "hash")
-    else:
-        parts = text.split("$")
-        if len(parts) != 6 or parts[0].lower() != "scrypt":
-            raise ValidationError("密码哈希格式应为 scrypt$n$r$p$salt$hash 或 JSON")
-        try:
-            n = int(parts[1])
-            r = int(parts[2])
-            p = int(parts[3])
-        except ValueError:
-            raise ValidationError("密码哈希 n/r/p 必须是整数")
-        salt = _b64decode(parts[4], "salt")
-        digest = _b64decode(parts[5], "hash")
-
-    _validate_scrypt_params(n, r, p, salt, digest)
-    return PasswordHash(n, r, p, salt, digest)
-
-
-def generate_password_hash(args: argparse.Namespace) -> int:
-    password = args.password or os.environ.get("LINKC_LAUNCHER_PASSWORD", "")
-    if not password:
-        try:
-            first = getpass.getpass("页面密码: ")
-            second = getpass.getpass("再次输入: ")
-        except (EOFError, KeyboardInterrupt):
-            print("\n错误: 需要密码。", file=sys.stderr)
-            return 1
-        if first != second:
-            print("错误: 两次输入的密码不一致。", file=sys.stderr)
-            return 1
-        password = first
-    if not password:
-        print("错误: 密码不能为空。", file=sys.stderr)
-        return 1
-    if len(password) > 4096:
-        print("错误: 密码过长。", file=sys.stderr)
-        return 1
-    if "\x00" in password:
-        print("错误: 密码不能包含 NUL。", file=sys.stderr)
-        return 1
-    if "\n" in password or "\r" in password:
-        print("错误: 密码不能包含换行。", file=sys.stderr)
-        return 1
-
-    n, r, p = 16384, 8, 1
-    salt = secrets.token_bytes(16)
-    try:
-        digest = hashlib.scrypt(
-            password.encode("utf-8"),
-            salt=salt,
-            n=n,
-            r=r,
-            p=p,
-            dklen=32,
-            maxmem=SCRYPT_MAXMEM,
-        )
-    except (ValueError, MemoryError) as exc:
-        print(f"错误: 生成 scrypt 哈希失败: {exc}", file=sys.stderr)
-        return 1
-
-    line = "scrypt${}${}${}${}${}".format(
-        n,
-        r,
-        p,
-        base64.b64encode(salt).decode("ascii"),
-        base64.b64encode(digest).decode("ascii"),
-    )
-
-    output_path: Path | None = None
-    if args.hash_password_output:
-        output_path = Path(args.hash_password_output).expanduser()
-        if not output_path.is_absolute():
-            output_path = Path.cwd() / output_path
-        output_path = Path(os.path.abspath(output_path))
-        if output_path.exists() and output_path.is_dir():
-            print(f"错误: 哈希输出路径是目录: {output_path}", file=sys.stderr)
-            return 1
-        try:
-            atomic_write(output_path, line + "\n", 0o600)
-        except OSError as exc:
-            print(f"错误: 写入哈希文件失败 {output_path}: {exc}", file=sys.stderr)
-            return 1
-        print(f"哈希文件: {output_path}（0600）")
-
-    print("密码哈希:")
-    print(line)
-    if output_path is not None:
-        print("启动示例:")
-        print(
-            "  ./scripts/docker-launch.sh --username admin "
-            f"--password-hash-file {shlex.quote(str(output_path))}"
-        )
-    else:
-        print("把上面的哈希保存到 0600 文件后，用 --password-hash-file 启动。")
-    return 0
-
-
 def atomic_write(path: Path, content: str, mode: int) -> None:
+    if path.is_symlink():
+        raise OSError(f"refusing to write through symlink: {path}")
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     fd, tmp = tempfile.mkstemp(prefix=f".{path.name}.", dir=str(path.parent))
+    fd_owned = False
     try:
         os.fchmod(fd, mode)
         with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
+            fd_owned = True
             handle.write(content)
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(tmp, path)
     except Exception:
-        try:
-            os.close(fd)
-        except OSError:
-            pass
+        if not fd_owned:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
         try:
             os.unlink(tmp)
         except OSError:
@@ -1019,16 +789,52 @@ def safe_atomic_write(path: Path, content: str, mode: int) -> None:
 
 
 def chown_tree(path: Path, uid: int, gid: int) -> None:
-    if not path.exists():
+    if path.is_symlink() or not path.exists():
         return
-    for root, dirs, files in os.walk(path):
-        os.chown(root, uid, gid)
+    os.chown(path, uid, gid, follow_symlinks=False)
+    for root, dirs, files in os.walk(path, followlinks=False):
+        os.chown(root, uid, gid, follow_symlinks=False)
         for name in dirs + files:
             item = os.path.join(root, name)
-            try:
-                os.chown(item, uid, gid, follow_symlinks=False)
-            except TypeError:
-                os.chown(item, uid, gid)
+            if os.path.islink(item):
+                continue
+            os.chown(item, uid, gid, follow_symlinks=False)
+
+
+def apply_config_dir_permissions(config_dir: Path) -> None:
+    """Keep config_dir root-owned while granting UID 10001 read-only access.
+
+    The container mounts config_dir :ro and runs as UID 10001.  Giving 10001
+    ownership of config_dir or host scripts like docker-run.sh would widen
+    host privilege boundaries, so root owns everything and only the files the
+    container actually reads get group 10001 with 0640/0750.
+    """
+    certs_dir = config_dir / CERTS_DIRNAME
+    backups_dir = config_dir / BACKUPS_DIRNAME
+    for d in (config_dir, certs_dir):
+        if d.exists() and not d.is_symlink():
+            os.chown(d, 0, 10001, follow_symlinks=False)
+            os.chmod(d, 0o750)
+    for name in (CONFIG_FILENAME, API_KEY_FILENAME, WHITELIST_FILENAME):
+        p = config_dir / name
+        if p.is_file() and not p.is_symlink():
+            os.chown(p, 0, 10001, follow_symlinks=False)
+            os.chmod(p, 0o640)
+    for name in ("fullchain.pem", "privkey.pem"):
+        p = certs_dir / name
+        if p.is_file() and not p.is_symlink():
+            os.chown(p, 0, 10001, follow_symlinks=False)
+            os.chmod(p, 0o640)
+    for p, mode in (
+        (config_dir / RUN_SCRIPT_FILENAME, 0o700),
+        (config_dir / METADATA_FILENAME, 0o600),
+    ):
+        if p.is_file() and not p.is_symlink():
+            os.chown(p, 0, 0, follow_symlinks=False)
+            os.chmod(p, mode)
+    if backups_dir.exists() and not backups_dir.is_symlink():
+        chown_tree(backups_dir, 0, 0)
+        os.chmod(backups_dir, 0o700)
 
 
 def ensure_owned_dir(path: Path, allowed: set[str], label: str) -> None:
@@ -1038,20 +844,29 @@ def ensure_owned_dir(path: Path, allowed: set[str], label: str) -> None:
     the container user, so pointing one at an unrelated directory would damage
     the host.  Refuse anything that is not empty and not launcher-managed.
     """
+    if path.is_symlink():
+        raise ValidationError(f"{label}不能是符号链接: {path}")
+    for parent in path.parents:
+        if parent.is_symlink():
+            raise ValidationError(f"{label}父路径包含符号链接: {parent}")
     try:
         if not path.exists():
             path.mkdir(parents=True, exist_ok=True, mode=0o700)
     except OSError as exc:
         raise ValidationError(f"无法创建{label} {path}: {exc}")
-    if not path.is_dir():
-        raise ValidationError(f"{label}不是目录: {path}")
+    if path.is_symlink() or not path.is_dir():
+        raise ValidationError(f"{label}不是有效目录: {path}")
     real = os.path.realpath(path)
     if real in _BLOCKED_DIRS:
         raise ValidationError(f"{label}解析后指向系统目录 {real}")
     try:
-        entries = {entry.name for entry in path.iterdir()}
+        dir_entries = list(path.iterdir())
     except OSError as exc:
         raise ValidationError(f"无法读取{label} {path}: {exc}")
+    for entry in dir_entries:
+        if entry.is_symlink():
+            raise ValidationError(f"{label} {path} 包含符号链接 {entry.name}，已拒绝操作")
+    entries = {entry.name for entry in dir_entries}
     unknown = sorted(entries - allowed)
     if unknown:
         shown = "、".join(unknown[:5])
@@ -1097,7 +912,7 @@ def prepare_files(values: dict[str, Any], existing: dict[str, Any], repo_root: P
         certs_dir / "fullchain.pem",
         certs_dir / "privkey.pem",
     ]
-    existing_files = [path for path in files_to_backup if path.is_file()]
+    existing_files = [path for path in files_to_backup if path.is_file() and not path.is_symlink()]
     if existing_files:
         stamp = local_timestamp()
         backup_dir = config_dir / BACKUPS_DIRNAME / stamp
@@ -1106,10 +921,10 @@ def prepare_files(values: dict[str, Any], existing: dict[str, Any], repo_root: P
             suffix += 1
             backup_dir = config_dir / BACKUPS_DIRNAME / f"{stamp}-{suffix}"
         try:
-            backup_dir.mkdir(parents=True)
+            backup_dir.mkdir(parents=True, mode=0o700)
             for path in existing_files:
-                shutil.copy2(path, backup_dir / path.name)
-        except OSError as exc:
+                safe_atomic_write(backup_dir / path.name, path.read_text(encoding="utf-8"), 0o600)
+        except (OSError, UnicodeDecodeError, ValidationError) as exc:
             backup_error = str(exc)
             warnings.append({"tone": "warn", "text": f"备份旧文件失败: {exc}"})
             backup_dir = None
@@ -1167,13 +982,18 @@ def prepare_files(values: dict[str, Any], existing: dict[str, Any], repo_root: P
     )
 
     if os.geteuid() == 0:
-        for directory in (config_dir, data_dir):
-            try:
-                chown_tree(directory, 10001, 10001)
-            except OSError as exc:
-                warnings.append(
-                    {"tone": "warn", "text": f"chown 10001:10001 失败 {directory}: {exc}"}
-                )
+        try:
+            apply_config_dir_permissions(config_dir)
+        except OSError as exc:
+            warnings.append(
+                {"tone": "warn", "text": f"设置配置目录权限失败 {config_dir}: {exc}"}
+            )
+        try:
+            chown_tree(data_dir, 10001, 10001)
+        except OSError as exc:
+            warnings.append(
+                {"tone": "warn", "text": f"chown 10001:10001 失败 {data_dir}: {exc}"}
+            )
 
     write_last_config_dir(str(config_dir))
 
@@ -1525,9 +1345,8 @@ def run_config_check(
     try:
         stage_config(values, existing, staging)
         if os.geteuid() == 0:
-            # The image runs as 10001; the check container must be able to read
-            # the staged files (the real config dir is chowned the same way).
-            chown_tree(staging, 10001, 10001)
+            # The check container mounts staging :ro as UID 10001.
+            apply_config_dir_permissions(staging)
         check_values = dict(values)
         check_values["config_dir"] = str(staging)
         result = run_cmd(docker_run_command(check_values, existing, check=True), timeout=120)
@@ -1652,9 +1471,9 @@ def restore_backup_files(
 
     if os.geteuid() == 0:
         try:
-            chown_tree(target, 10001, 10001)
+            apply_config_dir_permissions(target)
         except OSError as exc:
-            errors.append(f"chown {target}: {exc}")
+            errors.append(f"chmod/chown {target}: {exc}")
 
     detail_parts: list[str] = []
     if restored:
@@ -1724,6 +1543,9 @@ def replace_container(
 
     state, healthy = wait_container_start(name)
     if not healthy:
+        logs_res = run_cmd(["docker", "logs", "--tail", "80", name], timeout=15)
+        if logs_res.get("output"):
+            steps.append(make_step("失败容器日志", logs_res))
         run_cmd(["docker", "rm", "-f", name], timeout=60)
         steps.extend(restore_backup_files(backup_dir, values["config_dir"], backup_error))
         restored = restore_container(name, backup_name, steps, start=was_running)
@@ -1951,14 +1773,17 @@ def action_payload(action: str, payload: dict[str, Any], repo_root: Path) -> dic
 
 def state_payload(
     repo_root: Path,
-    auth_enabled: bool = False,
-    bind: str = "",
+    config_dir_override: str = "",
+    container_name_override: str = "",
 ) -> dict[str, Any]:
     defaults = default_values()
     config_dir = Path(defaults["config_dir"])
-    last = read_last_config_dir()
-    if last and (Path(last) / METADATA_FILENAME).is_file():
-        config_dir = Path(last)
+    if config_dir_override:
+        config_dir = Path(config_dir_override).expanduser()
+    else:
+        last = read_last_config_dir()
+        if last and (Path(last) / METADATA_FILENAME).is_file():
+            config_dir = Path(last)
 
     metadata, metadata_error = load_metadata(config_dir)
     values = dict(defaults)
@@ -1966,10 +1791,13 @@ def state_payload(
         for key in METADATA_KEYS:
             if key in metadata:
                 values[key] = metadata[key]
-        if metadata.get("config_dir"):
+        if metadata.get("config_dir") and not config_dir_override:
             config_dir = Path(str(metadata["config_dir"]))
+    if config_dir_override:
+        values["config_dir"] = str(config_dir)
+    if container_name_override:
+        values["container_name"] = container_name_override
 
-    exposed = bind not in ("", "127.0.0.1", "::1", "[::1]", "localhost")
     existing = existing_state(values)
     docker = docker_state()
     container = (
@@ -1979,26 +1807,6 @@ def state_payload(
     )
 
     warnings: list[dict[str, str]] = []
-    if exposed and not auth_enabled:
-        warnings.append(
-            {
-                "tone": "bad",
-                "text": (
-                    f"页面正在监听 {bind} 且未启用用户名/密码；任何能访问该端口的人"
-                    "只要拿到 token 就能控制 Docker。建议加 --username，或用防火墙限制来源。"
-                ),
-            }
-        )
-    elif exposed:
-        warnings.append(
-            {
-                "tone": "warn",
-                "text": (
-                    f"页面正在监听 {bind}；请用防火墙限制来源。"
-                    "Basic Auth 在纯 HTTP 下不加密。"
-                ),
-            }
-        )
     if os.geteuid() != 0:
         warnings.append(
             {
@@ -2040,9 +1848,6 @@ def state_payload(
         "gid": os.getgid(),
         "repo_root": str(repo_root),
         "dockerfile_exists": (repo_root / "Dockerfile").is_file(),
-        "auth_enabled": auth_enabled,
-        "bind": bind,
-        "exposed": exposed,
         "defaults": defaults,
         "values": values,
         "existing": existing,
@@ -2063,820 +1868,680 @@ def state_payload(
 
 
 # ---------------------------------------------------------------------------
-# HTTP server
+# Unix socket admin client & CLI helpers
 # ---------------------------------------------------------------------------
 
 
-def log_error(message: str) -> None:
-    sys.stderr.write(f"[{time.strftime('%H:%M:%S')}] {message}\n")
-    sys.stderr.flush()
-
-
-class LauncherServer(ThreadingHTTPServer):
-    daemon_threads = True
-    allow_reuse_address = True
-
-    def __init__(
-        self,
-        address: tuple[str, int],
-        handler: type[BaseHTTPRequestHandler],
-        *,
-        token: str,
-        html_path: Path,
-        repo_root: Path,
-        username: str = "",
-        password: str = "",
-        password_hash: PasswordHash | None = None,
-    ):
-        self.token = token
-        self.html_path = html_path
-        self.repo_root = repo_root
-        self.bind = address[0]
-        self.username = username
-        self.password = password
-        self.password_hash = password_hash
-        self.auth_cache: set[str] = set()
-        self.auth_cache_key = secrets.token_bytes(32)
-        self.auth_lock = threading.Lock()
-        self.auth_failures: dict[str, list[float]] = {}
-        self.auth_verify_slots = threading.BoundedSemaphore(AUTH_MAX_CONCURRENT_VERIFY)
-        self.action_lock = threading.Lock()
-        super().__init__(address, handler)
-
-
-class Handler(BaseHTTPRequestHandler):
-    server_version = "linkc-launcher/" + LAUNCHER_VERSION
-    protocol_version = "HTTP/1.1"
-    # A stalled client cannot pin a thread forever (slowloris-ish).
-    timeout = 30
-
-    # -- logging ---------------------------------------------------------
-
-    def log_message(self, fmt: str, *args: Any) -> None:
-        del fmt, args
-        path = urllib.parse.urlsplit(self.path).path
-        if path == "/api/preview":
-            return
-        if path.startswith("/api/") or path == "/":
-            log_error(f"{self.command} {path}")
-
-    # -- security checks -------------------------------------------------
-
-    def _client_ip(self) -> str:
-        try:
-            return str(self.client_address[0])
-        except (IndexError, TypeError):
-            return "?"
-
-    def _auth_locked_out(self) -> bool:
-        ip = self._client_ip()
-        now = time.monotonic()
-        with self.server.auth_lock:
-            stamps = [
-                stamp for stamp in self.server.auth_failures.get(ip, [])
-                if now - stamp < AUTH_FAILURE_WINDOW
-            ]
-            if stamps:
-                self.server.auth_failures[ip] = stamps
-            else:
-                self.server.auth_failures.pop(ip, None)
-            return len(stamps) >= AUTH_MAX_FAILURES
-
-    def _record_auth_failure(self) -> None:
-        ip = self._client_ip()
-        now = time.monotonic()
-        with self.server.auth_lock:
-            if len(self.server.auth_failures) > 1024:
-                self.server.auth_failures.clear()
-            stamps = [
-                stamp for stamp in self.server.auth_failures.get(ip, [])
-                if now - stamp < AUTH_FAILURE_WINDOW
-            ]
-            stamps.append(now)
-            self.server.auth_failures[ip] = stamps
-
-    def _check_auth(self) -> bool:
-        """Authenticate and answer 401/429 itself; False means stop."""
-        if not self.server.username:
-            return True
-        if self._auth_locked_out():
-            self._send_too_many()
-            return False
-        if self._auth_ok():
-            return True
-        self._record_auth_failure()
-        self._send_unauthorized()
-        return False
-
-    def _auth_ok(self) -> bool:
-        if not self.server.username:
-            return True
-        header = self.headers.get("Authorization", "")
-        scheme, _, encoded = header.partition(" ")
-        if scheme.lower() != "basic" or not encoded:
-            return False
-
-        cache_key = ""
-        if self.server.password_hash is not None:
-            cache_key = hmac.new(
-                self.server.auth_cache_key,
-                header.encode("utf-8"),
-                hashlib.sha256,
-            ).hexdigest()
-            with self.server.auth_lock:
-                if cache_key in self.server.auth_cache:
-                    return True
-
-        try:
-            decoded = base64.b64decode(encoded.strip(), validate=True).decode("utf-8")
-        except (ValueError, UnicodeDecodeError):
-            return False
-        if ":" not in decoded:
-            return False
-        user, password = decoded.split(":", 1)
-        if not hmac.compare_digest(user.encode("utf-8"), self.server.username.encode("utf-8")):
-            return False
-
-        if self.server.password_hash is not None:
-            if not self.server.auth_verify_slots.acquire(timeout=AUTH_VERIFY_TIMEOUT):
-                return False
-            try:
-                ok = self.server.password_hash.verify(password)
-            except (ValueError, MemoryError):
-                ok = False
-            finally:
-                self.server.auth_verify_slots.release()
-            if ok:
-                with self.server.auth_lock:
-                    if len(self.server.auth_cache) >= 128:
-                        self.server.auth_cache.clear()
-                    self.server.auth_cache.add(cache_key)
-            return ok
-
-        return hmac.compare_digest(
-            password.encode("utf-8"),
-            self.server.password.encode("utf-8"),
-        )
-
-    def _token_ok(self) -> bool:
-        token = self.headers.get("X-Launcher-Token", "")
-        if not token:
-            query = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
-            token = (query.get("token") or [""])[0]
-        return bool(token) and hmac.compare_digest(token, self.server.token)
-
-    def _host_ok(self) -> bool:
-        host = self.headers.get("Host", "")
-        if not host:
-            return False
-        hostname = host
-        if host.startswith("["):
-            end = host.find("]")
-            if end < 0:
-                return False
-            hostname = host[1:end]
-        elif host.count(":") == 1:
-            hostname = host.rsplit(":", 1)[0]
-        if hostname in ("localhost", "127.0.0.1", "::1"):
-            return True
-        try:
-            ipaddress.ip_address(hostname)
-            return True
-        except ValueError:
-            return False
-
-    def _origin_ok(self) -> bool:
-        origin = self.headers.get("Origin")
-        if not origin:
-            return True
-        return origin == f"http://{self.headers.get('Host', '')}"
-
-    # -- responses -------------------------------------------------------
-
-    def _send_bytes(
-        self,
-        status: int,
-        body: bytes,
-        content_type: str,
-        extra_headers: dict[str, str] | None = None,
-    ) -> None:
-        self.send_response(status)
-        self.send_header("Content-Type", content_type)
-        self.send_header("Content-Length", str(len(body)))
-        self.send_header("Cache-Control", "no-store")
-        self.send_header("X-Content-Type-Options", "nosniff")
-        self.send_header("X-Frame-Options", "DENY")
-        self.send_header("Referrer-Policy", "no-referrer")
-        self.send_header("Content-Security-Policy", CSP)
-        if self.close_connection:
-            self.send_header("Connection", "close")
-        if extra_headers:
-            for key, value in extra_headers.items():
-                self.send_header(key, value)
-        self.end_headers()
-        try:
-            self.wfile.write(body)
-        except (BrokenPipeError, ConnectionResetError):
-            pass
-
-    def _send_unauthorized(self) -> None:
-        self.close_connection = True
-        self._send_bytes(
-            401,
-            b"authentication required\n",
-            "text/plain; charset=utf-8",
-            {"WWW-Authenticate": 'Basic realm="linkc-node launcher", charset="UTF-8"'},
-        )
-
-    def _send_too_many(self) -> None:
-        self.close_connection = True
-        self._send_bytes(
-            429,
-            b"too many failed logins; retry later\n",
-            "text/plain; charset=utf-8",
-            {"Retry-After": str(int(AUTH_FAILURE_WINDOW))},
-        )
-
-    def _send_json(self, payload: Any, status: int = 200) -> None:
-        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-        self._send_bytes(status, body, "application/json; charset=utf-8")
-
-    def _send_text(self, status: int, text: str) -> None:
-        self._send_bytes(status, text.encode("utf-8"), "text/plain; charset=utf-8")
-
-    def _send_html(self) -> None:
-        try:
-            body = self.server.html_path.read_bytes()
-        except OSError as exc:
-            self._send_text(500, f"无法读取页面文件: {exc}")
-            return
-        self._send_bytes(200, body, "text/html; charset=utf-8")
-
-    def _send_forbidden(self) -> None:
-        body = """<!doctype html>
-<meta charset="utf-8">
-<title>需要启动 token</title>
-<body style="font-family:system-ui,sans-serif;max-width:720px;margin:10vh auto;padding:0 24px;line-height:1.7">
-<h1>需要启动 token</h1>
-<p>请回到运行 <code>docker-launch.sh</code> 的终端，复制完整地址（包含 <code>?token=...</code>）再打开。</p>
-<p>token 用于阻止其他网页调用本机的 Docker 控制接口；监听地址由 <code>--bind</code> 决定。</p>
-</body>"""
-        self._send_bytes(403, body.encode("utf-8"), "text/html; charset=utf-8")
-
-    # -- routes ----------------------------------------------------------
-
-    def do_GET(self) -> None:
-        try:
-            if not self._host_ok():
-                self._send_text(400, "Bad Host header")
-                return
-            if not self._check_auth():
-                return
-            path = urllib.parse.urlsplit(self.path).path
-            if path in ("/", "/index.html"):
-                if not self._token_ok():
-                    self._send_forbidden()
-                    return
-                self._send_html()
-                return
-            if path == "/api/health":
-                self._send_json({"ok": True})
-                return
-            if path == "/api/state":
-                if not self._token_ok():
-                    self._send_json({"ok": False, "error": "unauthorized"}, 403)
-                    return
-                self._send_json(
-                    state_payload(
-                        self.server.repo_root,
-                        auth_enabled=bool(self.server.username),
-                        bind=self.server.bind,
-                    )
-                )
-                return
-            if path == "/favicon.ico":
-                self.send_response(204)
-                self.send_header("Content-Length", "0")
-                self.end_headers()
-                return
-            self._send_json({"ok": False, "error": "not found"}, 404)
-        except Exception as exc:  # pragma: no cover - defensive
-            log_error(f"GET {self.path}: {exc}")
-            traceback.print_exc()
-            self._send_json({"ok": False, "error": str(exc)}, 500)
-
-    def do_POST(self) -> None:
-        try:
-            if not self._host_ok() or not self._origin_ok():
-                self._send_json({"ok": False, "error": "bad origin"}, 403)
-                return
-            if not self._check_auth():
-                return
-            if not self._token_ok():
-                self._send_json({"ok": False, "error": "unauthorized"}, 403)
-                return
-
-            path = urllib.parse.urlsplit(self.path).path
-            if path not in ("/api/preview", "/api/deploy", "/api/action", "/api/quit"):
-                self._send_json({"ok": False, "error": "not found"}, 404)
-                return
-
-            try:
-                length = int(self.headers.get("Content-Length", "0"))
-            except ValueError:
-                length = 0
-            if length <= 0 or length > 8 * 1024 * 1024:
-                # The body (if any) is left unread, so the connection cannot be
-                # reused: otherwise the leftover bytes would be parsed as the
-                # next request.
-                self.close_connection = True
-                self._send_json({"ok": False, "error": "请求体为空或过大"}, 413)
-                return
-            raw = self.rfile.read(length)
-            try:
-                payload = json.loads(raw.decode("utf-8"))
-            except (UnicodeDecodeError, json.JSONDecodeError):
-                self._send_json({"ok": False, "error": "JSON 解析失败"}, 400)
-                return
-            if not isinstance(payload, dict):
-                self._send_json({"ok": False, "error": "请求体必须是 JSON 对象"}, 400)
-                return
-
-            if path == "/api/preview":
-                self._send_json(preview_payload(payload.get("values", payload), self.server.repo_root))
-                return
-
-            if path == "/api/deploy":
-                values = payload.get("values", {})
-                mode = payload.get("mode", "deploy")
-                if mode not in ("deploy", "save", "check"):
-                    self._send_json({"ok": False, "error": "mode 不合法"}, 400)
-                    return
-                with self.server.action_lock:
-                    result = deploy(values, self.server.repo_root, mode)
-                self._send_json(result)
-                return
-
-            if path == "/api/action":
-                action = payload.get("action", "")
-                if not isinstance(action, str):
-                    self._send_json({"ok": False, "error": "action 不合法"}, 400)
-                    return
-                with self.server.action_lock:
-                    result = action_payload(action, payload, self.server.repo_root)
-                self._send_json(result)
-                return
-
-            if path == "/api/quit":
-                self._send_json({"ok": True, "message": "页面服务已关闭"})
-                threading.Thread(target=self.server.shutdown, daemon=True).start()
-                return
-        except Exception as exc:  # pragma: no cover - defensive
-            log_error(f"POST {self.path}: {exc}")
-            traceback.print_exc()
-            self._send_json({"ok": False, "error": str(exc)}, 500)
-
-
-# ---------------------------------------------------------------------------
-# entrypoint
-# ---------------------------------------------------------------------------
-
-
-def display_host(bind: str) -> str:
-    if bind in ("0.0.0.0", ""):
-        return "127.0.0.1"
-    if bind in ("::", "[::]"):
-        return "[::1]"
-    if ":" in bind and not bind.startswith("["):
-        return f"[{bind}]"
-    return bind
-
-
-def interface_ipv4_addresses() -> list[str]:
-    """Local IPv4 addresses, without probing any external host."""
-    addresses: list[str] = []
+def query_admin_socket(socket_path: str, endpoint: str) -> tuple[int, str]:
+    sock_path = socket_path.strip()
+    if not sock_path:
+        raise ValidationError("admin socket 路径不能为空")
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    sock.settimeout(5.0)
     try:
-        import fcntl
-        import struct
-    except ImportError:  # not available on Windows
-        return addresses
-    try:
-        names = [name for _, name in socket.if_nameindex()]
-    except (OSError, AttributeError):
-        return addresses
-    probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    try:
-        for name in names:
-            if name == "lo":
-                continue
-            try:
-                packed = fcntl.ioctl(
-                    probe.fileno(), 0x8915, struct.pack("256s", name.encode()[:15])
-                )
-            except OSError:
-                continue
-            addresses.append(socket.inet_ntoa(packed[20:24]))
+        sock.connect(sock_path)
+        req = f"GET {endpoint} HTTP/1.0\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+        sock.sendall(req.encode("ascii"))
+        chunks: list[bytes] = []
+        total = 0
+        while True:
+            chunk = sock.recv(65536)
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > 4 * 1024 * 1024:
+                raise DeploymentError(f"{endpoint} 响应超过 4 MiB")
+            chunks.append(chunk)
+    except OSError as exc:
+        raise DeploymentError(f"连接 {sock_path} 失败: {exc}") from exc
     finally:
-        probe.close()
-    return addresses
+        sock.close()
+
+    raw = b"".join(chunks)
+    sep = raw.find(b"\r\n\r\n")
+    if sep < 0:
+        raise DeploymentError(f"来自 {sock_path} 的响应不是合法 HTTP")
+    head = raw[:sep].decode("iso-8859-1", errors="replace")
+    body = raw[sep + 4:].decode("utf-8", errors="replace")
+    status_line = head.splitlines()[0] if head else ""
+    parts = status_line.split(" ", 2)
+    if len(parts) < 2 or not parts[1].isdigit():
+        raise DeploymentError(f"无法解析 HTTP 状态行: {status_line}")
+    return int(parts[1]), body
 
 
-def detect_lan_ip() -> str:
-    candidates = interface_ipv4_addresses()
+def _read_text_input(path_str: str, label: str, *, max_bytes: int = 2 * 1024 * 1024) -> str:
+    path = Path(path_str).expanduser()
+    if path.is_symlink():
+        raise ValidationError(f"{label} 不能是符号链接: {path}")
+    if not path.is_file():
+        raise ValidationError(f"找不到 {label}: {path}")
+    if path.stat().st_size > max_bytes:
+        raise ValidationError(f"{label} 过大: {path}")
+    return path.read_text(encoding="utf-8")
+
+
+def _load_cli_values(args: argparse.Namespace) -> dict[str, Any]:
+    raw = default_values()
+
+    if not getattr(args, "fresh", False):
+        cfg_dir = getattr(args, "config_dir", None)
+        if cfg_dir:
+            candidate = Path(cfg_dir).expanduser()
+        else:
+            last = read_last_config_dir()
+            candidate = (
+                Path(last)
+                if last and (Path(last) / METADATA_FILENAME).is_file()
+                else Path(raw["config_dir"])
+            )
+        metadata, metadata_error = load_metadata(candidate)
+        if metadata_error:
+            raise ValidationError(metadata_error)
+        if metadata:
+            for key in METADATA_KEYS:
+                if key in metadata:
+                    raw[key] = metadata[key]
+
+    config_json = getattr(args, "config_json", None)
+    if config_json:
+        if config_json == "-":
+            json_text = sys.stdin.read()
+        else:
+            json_text = _read_text_input(config_json, "--config-json")
+        try:
+            loaded = json.loads(json_text)
+        except json.JSONDecodeError as exc:
+            raise ValidationError(f"--config-json 解析失败: {exc}") from exc
+        if not isinstance(loaded, dict):
+            raise ValidationError("--config-json 顶层必须是 JSON 对象")
+        raw.update(loaded)
+
+    mapping = {
+        "panel_url": "base_url",
+        "node_id": "node_id",
+        "profile": "profile",
+        "allow_http": "allow_http",
+        "panel_tls_verify": "panel_tls_verify",
+        "panel_timeout": "panel_timeout",
+        "max_attempts": "max_attempts",
+        "max_response_mb": "max_response_mb",
+        "panel_proxy": "panel_proxy",
+        "listen": "listen",
+        "clear_certs": "clear_certs",
+        "audit_enabled": "audit_enabled",
+        "audit_action": "audit_action",
+        "limits_mode": "limits_mode",
+        "alive_ip_mode": "alive_ip_mode",
+        "include_online_zero": "include_online_zero",
+        "allow_private_targets": "allow_private_targets",
+        "whitelist": "whitelist",
+        "geodata_dir": "geodata_dir",
+        "image": "image",
+        "container_name": "container_name",
+        "config_dir": "config_dir",
+        "data_dir": "data_dir",
+        "restart_policy": "restart_policy",
+        "pull_latest": "pull_latest",
+        "build_local": "build_local",
+        "run_check": "run_check",
+        "no_new_privileges": "no_new_privileges",
+        "selinux_relabel": "selinux_relabel",
+        "log_level": "log_level",
+        "log_format": "log_format",
+        "pull_interval": "pull_interval",
+        "push_interval": "push_interval",
+        "collect_interval": "collect_interval",
+        "status_interval": "status_interval",
+        "max_journal_mb": "max_journal_mb",
+        "metrics": "metrics",
+        "pprof": "pprof",
+        "sniffing_mode": "sniffing_mode",
+        "mass_remove_guard": "mass_remove_guard",
+    }
+    for attr, key in mapping.items():
+        val = getattr(args, attr, None)
+        if val is not None:
+            raw[key] = val
+
+    api_key_sources = sum(
+        1
+        for flag in (
+            getattr(args, "api_key", None) is not None,
+            bool(getattr(args, "api_key_env", None)),
+            bool(getattr(args, "api_key_stdin", False)),
+            bool(getattr(args, "ask_api_key", False)),
+        )
+        if flag
+    )
+    if api_key_sources > 1:
+        raise ValidationError("--api-key / --api-key-env / --api-key-stdin / --ask-api-key 不能同时使用")
+    if getattr(args, "api_key", None) is not None:
+        raw["api_key"] = args.api_key
+    elif getattr(args, "api_key_env", None):
+        env_name = args.api_key_env
+        if env_name not in os.environ:
+            raise ValidationError(f"环境变量 {env_name} 未设置")
+        raw["api_key"] = os.environ[env_name]
+    elif getattr(args, "api_key_stdin", False):
+        if getattr(args, "config_json", None) == "-":
+            raise ValidationError("--api-key-stdin 不能与 --config-json - 同时使用")
+        raw["api_key"] = sys.stdin.read().strip()
+    elif getattr(args, "ask_api_key", False):
+        try:
+            raw["api_key"] = getpass.getpass("面板 API Key: ").strip()
+        except (EOFError, KeyboardInterrupt) as exc:
+            raise ValidationError("已取消输入 API Key") from exc
+
+    cert_file = getattr(args, "cert_file", None)
+    key_file = getattr(args, "key_file", None)
+    if bool(cert_file) != bool(key_file):
+        raise ValidationError("--cert-file 和 --key-file 必须成对提供")
+    if cert_file and key_file:
+        raw["cert_pem"] = _read_text_input(cert_file, "--cert-file")
+        raw["key_pem"] = _read_text_input(key_file, "--key-file")
+
+    whitelist_file = getattr(args, "whitelist_file", None)
+    if whitelist_file:
+        raw["whitelist"] = _read_text_input(whitelist_file, "--whitelist-file")
+
+    return raw
+
+
+def _print_warnings(warnings: list[dict[str, str]]) -> None:
+    if not warnings:
+        return
+    print("\n提示/告警:")
+    for item in warnings:
+        tone = str(item.get("tone", "info")).upper()
+        print(f"  [{tone}] {item.get('text', '')}")
+
+
+def _print_steps(steps: list[dict[str, Any]]) -> None:
+    if not steps:
+        return
+    print("\n执行步骤:")
+    for step in steps:
+        mark = "OK" if step.get("ok") else "FAIL"
+        detail = step.get("detail", "")
+        suffix = f" ({detail})" if detail else ""
+        print(f"  [{mark}] {step.get('name', '')}{suffix}")
+        output = str(step.get("output", "")).strip()
+        if not step.get("ok") and output:
+            print(f"       {output}")
+
+
+def _prompt(label: str, default: str = "") -> str:
+    suffix = f" [{default}]" if default else ""
     try:
-        for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
-            candidates.append(info[4][0])
-    except OSError:
-        pass
-    for ip in candidates:
-        if ip and not ip.startswith("127.") and ip != "0.0.0.0":
-            return ip
-    return ""
+        answer = input(f"{label}{suffix}: ").strip()
+    except EOFError:
+        return default
+    return answer if answer else default
 
 
-def can_open_browser() -> bool:
-    if sys.platform.startswith("linux"):
-        return bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
-    return True
+def _prompt_bool(label: str, default: bool) -> bool:
+    hint = "Y/n" if default else "y/N"
+    while True:
+        try:
+            answer = input(f"{label} [{hint}]: ").strip().lower()
+        except EOFError:
+            return default
+        if not answer:
+            return default
+        if answer in ("y", "yes", "1", "true"):
+            return True
+        if answer in ("n", "no", "0", "false"):
+            return False
+        print("请输入 y 或 n。")
 
 
-def open_browser(url: str) -> None:
+def _prompt_choice(label: str, choices: list[str], default: str) -> str:
+    opts = "/".join(choices)
+    while True:
+        answer = _prompt(f"{label} ({opts})", default).lower()
+        if answer in choices:
+            return answer
+        print(f"无效选项，请从 {opts} 中选择。")
+
+
+def run_wizard(repo_root: Path, args: argparse.Namespace) -> int:
     try:
-        opened = webbrowser.open(url)
-    except Exception:
-        opened = False
-    if not opened:
-        print("无法自动打开浏览器，请手动访问上面的地址。", flush=True)
+        raw = _load_cli_values(args)
+    except ValidationError as exc:
+        print(f"错误: {exc}", file=sys.stderr)
+        return 1
+
+    print("=" * 68)
+    print(" linkc-node Docker 命令行配置向导")
+    print("=" * 68)
+    print(f" 配置目录 : {raw['config_dir']}")
+    print(f" 数据目录 : {raw['data_dir']}")
+    print(f" 运行身份 : {'root' if os.geteuid() == 0 else f'UID {os.getuid()}:{os.getgid()}'}")
+    print("-" * 68)
+
+    try:
+        raw["config_dir"] = _prompt("配置目录", str(raw["config_dir"]))
+        raw["data_dir"] = _prompt("数据目录", str(raw["data_dir"]))
+        raw["container_name"] = _prompt("容器名称", str(raw["container_name"]))
+
+        existing = existing_state(normalize_values(
+            {
+                **raw,
+                "base_url": raw.get("base_url") or "https://panel.example.com",
+                "node_id": raw.get("node_id") or "1",
+                "api_key": raw.get("api_key") or "placeholder",
+            }
+        ))
+
+        raw["base_url"] = _prompt("面板地址 (https://...)", str(raw.get("base_url", "")))
+        if raw["base_url"].lower().startswith("http://"):
+            raw["allow_http"] = _prompt_bool("检测到 http://，是否允许明文 HTTP（仅测试）", bool(raw.get("allow_http")))
+        else:
+            raw["allow_http"] = False
+
+        raw["node_id"] = _prompt("节点 ID", str(raw.get("node_id", "")))
+        if not raw.get("api_key"):
+            key_hint = "面板 API Key (留空保留已有 api-key)" if existing["has_api_key"] else "面板 API Key"
+            raw["api_key"] = getpass.getpass(f"{key_hint}: ").strip()
+
+        raw["listen"] = _prompt("监听地址", str(raw.get("listen", "0.0.0.0")))
+
+        cert_default = "keep" if existing["has_certs"] else "none"
+        cert_choices = ["none", "files", "keep", "clear"] if existing["has_certs"] else ["none", "files"]
+        cert_mode = _prompt_choice("TLS 证书来源", cert_choices, cert_default)
+        if cert_mode == "files":
+            cert_path = _prompt("fullchain.pem 路径")
+            key_path = _prompt("privkey.pem 路径")
+            raw["cert_pem"] = _read_text_input(cert_path, "证书文件")
+            raw["key_pem"] = _read_text_input(key_path, "私钥文件")
+            raw["clear_certs"] = False
+        elif cert_mode == "clear":
+            raw["cert_pem"] = ""
+            raw["key_pem"] = ""
+            raw["clear_certs"] = True
+        else:
+            raw["clear_certs"] = False
+
+        has_dockerfile = (repo_root / "Dockerfile").is_file()
+        img_default = "build" if raw.get("build_local") and has_dockerfile else ("pull" if raw.get("pull_latest", True) else "local")
+        img_choices = ["pull", "build", "local"] if has_dockerfile else ["pull", "local"]
+        img_mode = _prompt_choice("镜像来源", img_choices, img_default)
+        raw["build_local"] = img_mode == "build"
+        raw["pull_latest"] = img_mode == "pull"
+        raw["image"] = _prompt("Docker 镜像", str(raw.get("image", DEFAULT_IMAGE)))
+
+        raw["audit_enabled"] = _prompt_bool("启用审计", bool(raw.get("audit_enabled", True)))
+        if raw["audit_enabled"]:
+            raw["audit_action"] = _prompt_choice("审计动作", ["report", "block"], str(raw.get("audit_action", "report")))
+        raw["limits_mode"] = _prompt_choice("限速/设备限制模式", ["enforce", "report", "off"], str(raw.get("limits_mode", "enforce")))
+        raw["allow_private_targets"] = _prompt_bool("允许代理访问内网目标（通常为 n）", bool(raw.get("allow_private_targets", False)))
+        raw["run_check"] = _prompt_bool("启动前执行 linkc-node check", bool(raw.get("run_check", True)))
+    except (KeyboardInterrupt, EOFError):
+        print("\n已取消。")
+        return 1
+    except ValidationError as exc:
+        print(f"\n错误: {exc}", file=sys.stderr)
+        return 1
+
+    preview = preview_payload(raw, repo_root)
+    if not preview.get("ok"):
+        print(f"\n校验失败: {preview.get('error', '未知错误')}", file=sys.stderr)
+        return 1
+
+    _print_warnings(preview.get("warnings", []))
+    print("\n--- 生成的 config.yaml ---")
+    print(preview["config"], end="")
+    print("\n--- Docker 启动命令 ---")
+    print(preview["command"])
+
+    action = _prompt_choice("下一步操作: deploy=部署启动, stage=仅生成配置, cancel=取消", ["deploy", "stage", "cancel"], "deploy")
+    if action == "cancel":
+        print("未修改任何文件或容器。")
+        return 0
+
+    mode = "deploy" if action == "deploy" else "save"
+    result = deploy(raw, repo_root, mode=mode)
+    if getattr(args, "json", False):
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return 0 if result.get("ok") else 1
+    return _render_deploy_result(result)
 
 
-def main(argv: list[str] | None = None) -> int:
+def _render_deploy_result(result: dict[str, Any]) -> int:
+    _print_steps(result.get("steps", []))
+    _print_warnings(result.get("warnings", []))
+    if not result.get("ok"):
+        print(f"\n失败: {result.get('error', '未知错误')}", file=sys.stderr)
+        return 1
+
+    paths = result.get("paths", {})
+    print("\n操作完成:")
+    if paths.get("config_path"):
+        print(f"  配置文件 : {paths['config_path']}")
+    if paths.get("api_key_path"):
+        print(f"  API Key  : {paths['api_key_path']}")
+    if paths.get("run_script_path"):
+        print(f"  启动脚本 : {paths['run_script_path']}")
+    if paths.get("host_socket"):
+        print(f"  管理 Sock: {paths['host_socket']}")
+    container = result.get("container", {})
+    if container and container.get("exists"):
+        print(
+            f"  容器状态 : {container.get('name')} ({container.get('status')}, "
+            f"health={container.get('health') or 'n/a'})"
+        )
+    return 0
+
+
+def _add_value_flags(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--fresh", action="store_true", help="ignore existing launcher.json defaults")
+    parser.add_argument("--config-json", default=None, help="load parameter overrides from JSON file (or - for stdin)")
+    parser.add_argument("--panel-url", default=None, help="panel base URL (https://...)")
+    parser.add_argument("--node-id", default=None, help="panel node ID")
+    parser.add_argument("--profile", default=None, help=f"panel profile (default: {DEFAULT_PROFILE})")
+    parser.add_argument("--api-key", default=None, help="panel API key (prefer --api-key-env or --api-key-stdin)")
+    parser.add_argument("--api-key-env", default=None, help="read panel API key from environment variable")
+    parser.add_argument("--api-key-stdin", action="store_true", help="read panel API key from stdin")
+    parser.add_argument("--ask-api-key", action="store_true", help="prompt interactively for panel API key")
+    parser.add_argument("--allow-http", dest="allow_http", action="store_true", default=None, help="allow http:// panel URL (testing only)")
+    parser.add_argument("--no-allow-http", dest="allow_http", action="store_false", default=None, help="require https:// panel URL")
+    parser.add_argument("--panel-tls-verify", dest="panel_tls_verify", action="store_true", default=None, help="verify panel TLS certificate")
+    parser.add_argument("--no-panel-tls-verify", dest="panel_tls_verify", action="store_false", default=None, help="disable panel TLS verification")
+    parser.add_argument("--panel-timeout", default=None, help="panel HTTP timeout duration (e.g. 15s)")
+    parser.add_argument("--max-attempts", type=int, default=None, help="panel HTTP max retry attempts (1..10)")
+    parser.add_argument("--max-response-mb", type=int, default=None, help="panel max response size MiB (1..256)")
+    parser.add_argument("--panel-proxy", default=None, help="HTTP/SOCKS5 proxy URL for panel requests")
+    parser.add_argument("--listen", default=None, help="node listen IP address (default: 0.0.0.0)")
+    parser.add_argument("--cert-file", default=None, help="TLS fullchain PEM file to stage")
+    parser.add_argument("--key-file", default=None, help="TLS private key PEM file to stage")
+    parser.add_argument("--clear-certs", action="store_true", default=None, help="remove staged TLS certificates")
+    parser.add_argument("--audit-enabled", dest="audit_enabled", action="store_true", default=None, help="enable audit rules")
+    parser.add_argument("--no-audit-enabled", dest="audit_enabled", action="store_false", default=None, help="disable audit rules")
+    parser.add_argument("--audit-action", choices=["report", "block"], default=None, help="audit action")
+    parser.add_argument("--limits-mode", choices=["enforce", "report", "off"], default=None, help="speed/device limits mode")
+    parser.add_argument("--alive-ip-mode", choices=["changed", "full", "off"], default=None, help="alive_ip push mode")
+    parser.add_argument("--include-online-zero", dest="include_online_zero", action="store_true", default=None)
+    parser.add_argument("--no-include-online-zero", dest="include_online_zero", action="store_false", default=None)
+    parser.add_argument("--allow-private-targets", dest="allow_private_targets", action="store_true", default=None)
+    parser.add_argument("--no-allow-private-targets", dest="allow_private_targets", action="store_false", default=None)
+    parser.add_argument("--whitelist-file", default=None, help="local audit whitelist file to copy")
+    parser.add_argument("--whitelist", default=None, help="inline audit whitelist content")
+    parser.add_argument("--geodata-dir", default=None, help="host directory containing geoip.dat/geosite.dat")
+    parser.add_argument("--image", default=None, help=f"Docker image (default: {DEFAULT_IMAGE})")
+    parser.add_argument("--container-name", default=None, help=f"Docker container name (default: {DEFAULT_CONTAINER})")
+    parser.add_argument("--config-dir", default=None, help="host config directory")
+    parser.add_argument("--data-dir", default=None, help="host data directory")
+    parser.add_argument("--restart-policy", choices=["unless-stopped", "always", "on-failure", "no"], default=None)
+    parser.add_argument("--pull-latest", dest="pull_latest", action="store_true", default=None, help="pull image before deploy")
+    parser.add_argument("--no-pull-latest", dest="pull_latest", action="store_false", default=None, help="do not pull image")
+    parser.add_argument("--build-local", dest="build_local", action="store_true", default=None, help="docker build from --repo-root")
+    parser.add_argument("--no-build-local", dest="build_local", action="store_false", default=None, help="do not docker build locally")
+    parser.add_argument("--run-check", dest="run_check", action="store_true", default=None, help="run linkc-node check before starting")
+    parser.add_argument("--no-run-check", dest="run_check", action="store_false", default=None, help="skip linkc-node check")
+    parser.add_argument("--no-new-privileges", dest="no_new_privileges", action="store_true", default=None)
+    parser.add_argument("--allow-new-privileges", dest="no_new_privileges", action="store_false", default=None)
+    parser.add_argument("--selinux-relabel", dest="selinux_relabel", action="store_true", default=None)
+    parser.add_argument("--no-selinux-relabel", dest="selinux_relabel", action="store_false", default=None)
+    parser.add_argument("--log-level", choices=["debug", "info", "warn", "error"], default=None)
+    parser.add_argument("--log-format", choices=["json", "text"], default=None)
+    parser.add_argument("--pull-interval", default=None)
+    parser.add_argument("--push-interval", default=None)
+    parser.add_argument("--collect-interval", default=None)
+    parser.add_argument("--status-interval", default=None)
+    parser.add_argument("--max-journal-mb", type=int, default=None)
+    parser.add_argument("--metrics", dest="metrics", action="store_true", default=None)
+    parser.add_argument("--no-metrics", dest="metrics", action="store_false", default=None)
+    parser.add_argument("--pprof", dest="pprof", action="store_true", default=None)
+    parser.add_argument("--no-pprof", dest="pprof", action="store_false", default=None)
+    parser.add_argument("--sniffing-mode", choices=["auto", "on", "off"], default=None)
+    parser.add_argument("--mass-remove-guard", choices=["warn", "reject", "off"], default=None)
+
+
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="linkc-node Docker launcher with a local web UI",
-        epilog=(
-            "Non-loopback binds require --username. Use --bind 127.0.0.1 for token-only "
-            "local access. A random password is generated and printed unless --password, "
-            "LINKC_LAUNCHER_PASSWORD, or --ask-password is used. Generated credentials "
-            "are also written as JSON to a 0600 file unless --no-credentials-file is used. "
-            "Use --password-hash-file to read a scrypt hash; --hash-password generates one."
-        ),
+        prog="docker-launch.sh",
+        description="CLI tool for deploying and managing linkc-node in Docker.",
     )
-    parser.add_argument("--port", type=int, default=0, help="listen port (0 = random free port)")
-    parser.add_argument(
-        "--bind",
-        default="0.0.0.0",
-        help=(
-            "listen address (default: 0.0.0.0; non-loopback requires --username; "
-            "use 127.0.0.1 for local-only)"
-        ),
-    )
-    parser.add_argument("--no-browser", action="store_true", help="do not open a browser")
     parser.add_argument(
         "--repo-root",
         default=str(Path(__file__).resolve().parent.parent),
         help="repository root (for local docker build)",
     )
-    parser.add_argument(
-        "--html",
-        default=str(Path(__file__).resolve().parent / "docker-launcher.html"),
-        help="path to the launcher HTML file",
-    )
-    parser.add_argument(
-        "--username",
-        default=os.environ.get("LINKC_LAUNCHER_USER", ""),
-        help=(
-            "enable HTTP Basic Auth for the page (required for non-loopback binds; "
-            "default: $LINKC_LAUNCHER_USER)"
-        ),
-    )
-    parser.add_argument(
-        "--password",
-        default=os.environ.get("LINKC_LAUNCHER_PASSWORD", ""),
-        help=(
-            "HTTP Basic Auth password (default: $LINKC_LAUNCHER_PASSWORD; "
-            "otherwise a random password is generated and printed)"
-        ),
-    )
-    parser.add_argument(
-        "--ask-password",
-        action="store_true",
-        help="prompt for the page password instead of generating one",
-    )
-    parser.add_argument(
-        "--credentials-file",
-        default=None,
-        help=(
-            "write generated page credentials as JSON to this 0600 file "
-            "(default: ~/.linkc-node/launcher-credentials.json; "
-            "env: $LINKC_LAUNCHER_CREDENTIALS_FILE)"
-        ),
-    )
-    parser.add_argument(
-        "--no-credentials-file",
-        action="store_true",
-        help="do not write generated page credentials to disk",
-    )
-    parser.add_argument(
-        "--password-hash-file",
-        default=os.environ.get("LINKC_LAUNCHER_PASSWORD_HASH_FILE", ""),
-        help=(
-            "read the page password hash from this file "
-            "(scrypt; JSON or one-line; env: $LINKC_LAUNCHER_PASSWORD_HASH_FILE)"
-        ),
-    )
-    parser.add_argument(
-        "--hash-password",
-        action="store_true",
-        help="generate a scrypt password hash and exit",
-    )
-    parser.add_argument(
-        "--hash-password-output",
-        default="",
-        help="with --hash-password, write the hash to this 0600 file",
-    )
     parser.add_argument("--version", action="version", version=f"%(prog)s {LAUNCHER_VERSION}")
-    args = parser.parse_args(argv)
+    sub = parser.add_subparsers(dest="command", metavar="COMMAND")
 
+    p_wizard = sub.add_parser("wizard", aliases=["init"], help="interactive setup wizard")
+    p_wizard.add_argument("--fresh", action="store_true", help="ignore existing launcher.json defaults")
+    p_wizard.add_argument("--config-dir", default=None, help="host config directory")
+    p_wizard.add_argument("--json", action="store_true", help="output final result as JSON")
+
+    p_deploy = sub.add_parser("deploy", help="stage config, validate, and deploy container")
+    _add_value_flags(p_deploy)
+    p_deploy.add_argument("--stage-only", action="store_true", help="write config files without starting container")
+    p_deploy.add_argument("--dry-run", action="store_true", help="preview config and docker command without writing")
+    p_deploy.add_argument("--json", action="store_true", help="output JSON")
+
+    p_preview = sub.add_parser("preview", help="preview config.yaml, docker command, and warnings")
+    _add_value_flags(p_preview)
+    p_preview.add_argument("--json", action="store_true", help="output JSON")
+
+    p_stage = sub.add_parser("stage", help="write config.yaml, api-key, and docker-run.sh without starting")
+    _add_value_flags(p_stage)
+    p_stage.add_argument("--json", action="store_true", help="output JSON")
+
+    p_check = sub.add_parser("check", help="validate config using temporary linkc-node check container")
+    _add_value_flags(p_check)
+    p_check.add_argument("--json", action="store_true", help="output JSON")
+
+    p_status = sub.add_parser("status", aliases=["state"], help="show Docker, container, and config status")
+    p_status.add_argument("--config-dir", default="", help="host config directory")
+    p_status.add_argument("--container-name", default="", help="Docker container name")
+    p_status.add_argument("--json", action="store_true", help="output JSON")
+
+    p_logs = sub.add_parser("logs", help="show or follow container logs")
+    p_logs.add_argument("--container-name", default="", help="Docker container name")
+    p_logs.add_argument("-n", "--tail", type=int, default=200, help="number of lines to show (default: 200)")
+    p_logs.add_argument("-f", "--follow", action="store_true", help="follow log output")
+    p_logs.add_argument("--json", action="store_true", help="output JSON")
+
+    for act, desc in (
+        ("start", "start managed container"),
+        ("stop", "stop managed container"),
+        ("restart", "restart managed container"),
+        ("remove", "stop and remove managed container"),
+    ):
+        p_act = sub.add_parser(act, help=desc)
+        p_act.add_argument("--container-name", default="", help="Docker container name")
+        p_act.add_argument("--json", action="store_true", help="output JSON")
+
+    for cmd_name, desc in (
+        ("node-status", "query node /status over admin Unix socket"),
+        ("node-metrics", "query node /metrics over admin Unix socket"),
+        ("node-ready", "query node /readyz over admin Unix socket"),
+    ):
+        p_node = sub.add_parser(cmd_name, help=desc)
+        p_node.add_argument("--config-dir", default="", help="host config directory")
+        p_node.add_argument("-s", "--socket", default="", help="explicit admin.sock path")
+        p_node.add_argument("--json", action="store_true", help="output JSON")
+
+    return parser
+
+
+def _resolve_container_name(explicit: str) -> str:
+    if explicit:
+        return explicit
+    last = read_last_config_dir()
+    if last:
+        meta, _ = load_metadata(Path(last))
+        if meta and meta.get("container_name"):
+            return str(meta["container_name"])
+    return DEFAULT_CONTAINER
+
+
+def main(argv: list[str] | None = None) -> int:
     if sys.version_info < (3, 8):
         print("错误: 需要 Python 3.8 或更新版本。", file=sys.stderr)
         return 1
-    if args.hash_password:
-        if args.password_hash_file:
-            print(
-                "错误: --hash-password 不能和 --password-hash-file 同时使用。",
-                file=sys.stderr,
-            )
-            return 1
-        return generate_password_hash(args)
-    if args.hash_password_output:
-        print("错误: --hash-password-output 需要 --hash-password。", file=sys.stderr)
-        return 1
-    if args.port < 0 or args.port > 65535:
-        parser.error("--port 必须在 0..65535 之间")
 
-    html_path = Path(args.html).resolve()
-    if not html_path.is_file():
-        print(f"错误: 找不到页面文件 {html_path}", file=sys.stderr)
-        return 1
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if not args.command:
+        parser.print_help()
+        return 0
+
     repo_root = Path(args.repo_root).resolve()
 
-    password_hash: PasswordHash | None = None
-    password_hash_path = ""
-    if args.password_hash_file:
-        hash_file = Path(args.password_hash_file).expanduser()
-        if not hash_file.is_absolute():
-            hash_file = Path.cwd() / hash_file
-        password_hash_path = str(Path(os.path.abspath(hash_file)))
+    if args.command in ("wizard", "init"):
+        return run_wizard(repo_root, args)
+
+    if args.command in ("preview", "stage", "check", "deploy"):
         try:
-            password_hash = load_password_hash(Path(password_hash_path))
+            raw = _load_cli_values(args)
         except ValidationError as exc:
-            print(f"错误: {exc}", file=sys.stderr)
-            return 1
-
-    username = args.username.strip()
-    password = args.password
-    password_source = "provided"
-
-    if password_hash is not None:
-        if password or args.ask_password:
-            print(
-                "错误: --password-hash-file 不能和 --password/--ask-password/"
-                "LINKC_LAUNCHER_PASSWORD 同时使用。",
-                file=sys.stderr,
-            )
-            return 1
-        if not username:
-            print(
-                "错误: --password-hash-file 需要同时提供 --username。",
-                file=sys.stderr,
-            )
-            return 1
-        password = ""
-        password_source = "hash"
-    else:
-        if args.ask_password and password:
-            print(
-                "错误: --ask-password 不能和 --password / LINKC_LAUNCHER_PASSWORD 同时使用。",
-                file=sys.stderr,
-            )
-            return 1
-        if args.ask_password and not username:
-            print("错误: --ask-password 需要同时提供 --username。", file=sys.stderr)
-            return 1
-
-        if username and not password:
-            if args.ask_password:
-                try:
-                    password = getpass.getpass(f"页面登录密码（{username}）: ")
-                except (EOFError, KeyboardInterrupt):
-                    print("\n错误: 需要密码才能启用页面登录。", file=sys.stderr)
-                    return 1
-                password_source = "prompted"
+            if args.json:
+                print(json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False))
             else:
-                password = secrets.token_urlsafe(18)
-                password_source = "generated"
-
-        if password and not username:
-            print("错误: 设置密码时必须同时提供用户名。", file=sys.stderr)
+                print(f"错误: {exc}", file=sys.stderr)
             return 1
 
-    if password and ("\n" in password or "\r" in password or "\x00" in password):
-        print("错误: 密码不能包含换行或 NUL。", file=sys.stderr)
-        return 1
+        if args.command == "preview" or getattr(args, "dry_run", False):
+            res = preview_payload(raw, repo_root)
+            if args.json:
+                print(json.dumps(res, ensure_ascii=False, indent=2))
+                return 0 if res.get("ok") else 1
+            if not res.get("ok"):
+                print(f"错误: {res.get('error', '未知错误')}", file=sys.stderr)
+                return 1
+            _print_warnings(res.get("warnings", []))
+            print("--- config.yaml ---")
+            print(res["config"], end="")
+            print("\n--- docker run ---")
+            print(res["command"])
+            return 0
 
-    if username:
-        if ":" in username:
-            print("错误: 用户名不能包含冒号。", file=sys.stderr)
-            return 1
-        if any(ord(char) < 0x20 for char in username):
-            print("错误: 用户名不能包含控制字符。", file=sys.stderr)
-            return 1
-        if not password and password_hash is None:
-            print("错误: 密码不能为空。", file=sys.stderr)
-            return 1
+        mode = "save" if (args.command == "stage" or getattr(args, "stage_only", False)) else (
+            "check" if args.command == "check" else "deploy"
+        )
+        res = deploy(raw, repo_root, mode=mode)
+        if args.json:
+            print(json.dumps(res, ensure_ascii=False, indent=2))
+            return 0 if res.get("ok") else 1
+        return _render_deploy_result(res)
 
-    if args.no_credentials_file and args.credentials_file:
-        print(
-            "错误: --no-credentials-file 不能和 --credentials-file 同时使用。",
-            file=sys.stderr,
+    if args.command in ("status", "state"):
+        res = state_payload(
+            repo_root,
+            config_dir_override=args.config_dir,
+            container_name_override=args.container_name,
         )
-        return 1
-
-    if args.credentials_file and password_source != "generated":
-        print(
-            "错误: --credentials-file 只在自动生成密码时生效；"
-            "--password / --ask-password / --password-hash-file 不会写入凭据文件。",
-            file=sys.stderr,
-        )
-        return 1
-
-    credentials_path: Path | None = None
-    if password_source == "generated" and not args.no_credentials_file:
-        raw_credentials = args.credentials_file or os.environ.get(
-            "LINKC_LAUNCHER_CREDENTIALS_FILE", ""
-        )
-        credentials_path = (
-            Path(raw_credentials).expanduser()
-            if raw_credentials
-            else default_credentials_path()
-        )
-        if not credentials_path.is_absolute():
-            credentials_path = Path.cwd() / credentials_path
-        credentials_path = Path(os.path.abspath(credentials_path))
-        if credentials_path.exists() and credentials_path.is_dir():
+        if args.json:
+            print(json.dumps(res, ensure_ascii=False, indent=2))
+            return 0
+        docker = res["docker"]
+        container = res["container"]
+        paths = res["paths"]
+        print(f"Launcher  : v{res['launcher_version']} (Python {res['python']})")
+        print(f"Docker    : {'ok ' + docker.get('version', '') if docker.get('ok') else docker.get('error', '不可用')}")
+        if container.get("exists"):
             print(
-                f"错误: 凭据文件路径是目录: {credentials_path}",
-                file=sys.stderr,
+                f"Container : {container.get('name')} | status={container.get('status')} "
+                f"| managed={container.get('managed')} | health={container.get('health') or 'n/a'} "
+                f"| restarts={container.get('restart_count', 0)}"
             )
+        else:
+            print(f"Container : {res['values']['container_name']} (未创建)")
+        print(f"Config    : {paths['config_path']} ({'存在' if res['existing']['config_exists'] else '未生成'})")
+        print(f"API Key   : {paths['api_key_path']} ({'存在' if res['existing']['has_api_key'] else '未设置'})")
+        print(f"Data Dir  : {paths['data_dir']}")
+        print(f"Admin Sock: {paths['host_socket']}")
+        _print_warnings(res.get("warnings", []))
+        return 0
+
+    if args.command == "logs":
+        name = _resolve_container_name(args.container_name)
+        if not _CONTAINER_RE.match(name):
+            print("错误: 容器名称不合法", file=sys.stderr)
             return 1
-
-    loopback_binds = ("127.0.0.1", "::1", "[::1]", "localhost")
-    if args.bind not in loopback_binds and not username:
-        print(
-            f"错误: 监听 {args.bind} 时必须设置页面用户名/密码。",
-            file=sys.stderr,
+        if args.follow and args.json:
+            print("错误: --follow 不能与 --json 同时使用", file=sys.stderr)
+            return 1
+        if args.follow:
+            proc = subprocess.run(
+                ["docker", "logs", "-f", "--tail", str(max(1, args.tail)), "--timestamps", name],
+                check=False,
+            )
+            return proc.returncode
+        if args.json:
+            res = action_payload("logs", {"container_name": name}, repo_root)
+            print(json.dumps(res, ensure_ascii=False, indent=2))
+            return 0 if res.get("ok") else 1
+        result = run_cmd(
+            ["docker", "logs", "--tail", str(max(1, args.tail)), "--timestamps", name],
+            timeout=20,
         )
-        print(
-            "  推荐: ./scripts/docker-launch.sh --username admin",
-            file=sys.stderr,
-        )
-        print(
-            "  仅本机: ./scripts/docker-launch.sh --bind 127.0.0.1",
-            file=sys.stderr,
-        )
-        return 1
+        if result["output"]:
+            print(result["output"], end="" if result["output"].endswith("\n") else "\n")
+        return 0 if result["code"] == 0 else 1
 
-    if ":" in args.bind:
-        LauncherServer.address_family = socket.AF_INET6
+    if args.command in ("start", "stop", "restart", "remove"):
+        name = _resolve_container_name(args.container_name)
+        res = action_payload(args.command, {"container_name": name}, repo_root)
+        if args.json:
+            print(json.dumps(res, ensure_ascii=False, indent=2))
+            return 0 if res.get("ok") else 1
+        _print_steps(res.get("steps", []))
+        if not res.get("ok"):
+            print(f"错误: {res.get('error', '操作失败')}", file=sys.stderr)
+            return 1
+        container = res.get("container", {})
+        if container:
+            print(f"容器 {container.get('name', name)}: status={container.get('status', 'unknown')}")
+        return 0
 
-    token = secrets.token_urlsafe(24)
-    try:
-        server = LauncherServer(
-            (args.bind, args.port),
-            Handler,
-            token=token,
-            html_path=html_path,
-            repo_root=repo_root,
-            username=username,
-            password=password,
-            password_hash=password_hash,
-        )
-    except OSError as exc:
-        print(f"无法监听 {args.bind}:{args.port}: {exc}", file=sys.stderr)
-        return 1
-
-    port = server.server_address[1]
-    local_url = f"http://{display_host(args.bind)}:{port}/?token={token}"
-    lan_url = ""
-    if args.bind == "0.0.0.0":
-        lan_ip = detect_lan_ip()
-        if lan_ip:
-            lan_url = f"http://{lan_ip}:{port}/?token={token}"
-    url = local_url
-
-    credentials_written = False
-    if username and password_source == "generated" and credentials_path is not None:
+    if args.command in ("node-status", "node-metrics", "node-ready"):
+        sock = args.socket
+        if not sock:
+            st = state_payload(repo_root, config_dir_override=args.config_dir)
+            sock = st["paths"]["host_socket"]
+        endpoint_map = {
+            "node-status": "/status",
+            "node-metrics": "/metrics",
+            "node-ready": "/readyz",
+        }
+        endpoint = endpoint_map[args.command]
         try:
-            write_credentials_file(
-                credentials_path,
-                url=local_url,
-                lan_url=lan_url,
-                username=username,
-                password=password,
-                listen=args.bind,
-                port=port,
-            )
-            credentials_written = True
-        except OSError as exc:
-            print(
-                f"警告: 无法写入凭据文件 {credentials_path}: {exc}",
-                file=sys.stderr,
-            )
-
-    defaults = default_values()
-    config_dir = Path(defaults["config_dir"])
-    data_dir = Path(defaults["data_dir"])
-    last = read_last_config_dir()
-    if last and (Path(last) / METADATA_FILENAME).is_file():
-        config_dir = Path(last)
-    metadata, _ = load_metadata(config_dir)
-    if metadata:
-        config_dir = Path(str(metadata.get("config_dir", config_dir)))
-        data_dir = Path(str(metadata.get("data_dir", data_dir)))
-
-    print("=" * 68)
-    print(" linkc-node Docker 启动器")
-    print("=" * 68)
-    print(f" 页面地址 : {local_url}")
-    if lan_url:
-        print(f" 局域网   : {lan_url}")
-    print(f" 配置目录 : {config_dir}")
-    print(f" 数据目录 : {data_dir}")
-    print(f" 运行身份 : {'root' if os.geteuid() == 0 else f'UID {os.getuid()}:{os.getgid()}'}")
-    if username:
-        if password_source == "hash":
-            print(f" 页面登录 : {username}")
-            print(f" 密码哈希 : {password_hash_path}（scrypt）")
-        elif password_source == "generated":
-            print(f" 页面登录 : {username}")
-            print(f" 登录密码 : {password}  （自动生成，只显示这一次）")
-            if credentials_path is None:
-                print(" 凭据文件 : 未写入（--no-credentials-file）")
-            elif credentials_written:
-                print(f" 凭据文件 : {credentials_path}（0600）")
+            status_code, body = query_admin_socket(sock, endpoint)
+        except (ValidationError, DeploymentError) as exc:
+            if args.json:
+                print(json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False))
             else:
-                print(f" 凭据文件 : 写入失败（{credentials_path}），密码见上方")
-        elif password_source == "prompted":
-            print(f" 页面登录 : {username} / ********（手动输入）")
-        else:
-            print(f" 页面登录 : {username} / ********（已提供）")
-        print(" 登录方式 : 浏览器会弹出 HTTP Basic Auth 用户名/密码框")
-    else:
-        print(" 页面登录 : 未启用（仅 token）")
-    if not shutil.which("docker"):
-        print(" 警告     : 未找到 docker 命令；页面仍可生成配置，但无法启动容器。")
-    if args.bind not in ("127.0.0.1", "::1", "[::1]", "localhost"):
-        if username:
+                print(f"错误: {exc}", file=sys.stderr)
+            return 1
+        if args.json and args.command != "node-status":
             print(
-                f" 提示     : 正在监听 {args.bind}，网络内可访问；"
-                "请用防火墙限制来源。Basic Auth 在 HTTP 下不加密。"
+                json.dumps(
+                    {"ok": status_code == 200, "status_code": status_code, "body": body},
+                    ensure_ascii=False,
+                    indent=2,
+                )
             )
+            return 0 if status_code == 200 else 1
+        if status_code != 200:
+            print(f"HTTP {status_code}: {body.strip()}", file=sys.stderr)
+            return 1
+        if args.command == "node-status":
+            try:
+                parsed = json.loads(body)
+                print(json.dumps(parsed, ensure_ascii=False, indent=2))
+            except json.JSONDecodeError:
+                print(body, end="" if body.endswith("\n") else "\n")
         else:
-            print(
-                f" 警告     : 正在监听 {args.bind}，网络内可访问；"
-                "必须设置 --username。"
-            )
-    print("-" * 68)
-    print(" 按 Ctrl+C 结束页面服务；Docker 容器会继续运行。")
-    print(" 不要把带 token 的地址发给别人。")
-    print("=" * 68, flush=True)
+            print(body, end="" if body.endswith("\n") else "\n")
+        return 0
 
-    should_open = not args.no_browser and can_open_browser()
-    if os.geteuid() == 0 and os.environ.get("SUDO_USER"):
-        print("检测到 sudo：不自动打开浏览器，请手动复制上面的地址。", flush=True)
-        should_open = False
-    if should_open:
-        timer = threading.Timer(0.4, open_browser, args=(url,))
-        timer.daemon = True
-        timer.start()
-    else:
-        print("请手动打开上面的地址。", flush=True)
-
-    def shutdown(signum: int, frame: Any) -> None:
-        del signum, frame
-        threading.Thread(target=server.shutdown, daemon=True).start()
-
-    signal.signal(signal.SIGTERM, shutdown)
-    try:
-        signal.signal(signal.SIGINT, shutdown)
-    except ValueError:
-        pass
-
-    try:
-        server.serve_forever()
-    finally:
-        server.server_close()
-        print("\n页面服务已退出；Docker 容器不受影响。", flush=True)
-    return 0
+    parser.print_help()
+    return 1
 
 
 if __name__ == "__main__":

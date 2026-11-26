@@ -1,18 +1,16 @@
 #!/usr/bin/env bash
-# One-command entrypoint for the linkc-node Docker launcher.
+# One-command CLI entrypoint for deploying and managing linkc-node in Docker.
 #
-#   sudo ./scripts/docker-launch.sh --username admin # default 0.0.0.0; auto password
-#   # generated password: ~/.linkc-node/launcher-credentials.json (0600 JSON)
-#   sudo ./scripts/docker-launch.sh --username admin --ask-password # type your own
-#   sudo ./scripts/docker-launch.sh --hash-password --hash-password-output /root/.linkc-node/password.hash
-#   sudo ./scripts/docker-launch.sh --username admin --password-hash-file /root/.linkc-node/password.hash
-#   sudo ./scripts/docker-launch.sh --bind 127.0.0.1 # local-only, token-only allowed
-#   ./scripts/docker-launch.sh --username admin      # non-root: ~/.linkc-node
-#   ./scripts/docker-launch.sh --username admin --no-browser
+#   sudo ./scripts/docker-launch.sh wizard            # interactive setup
+#   sudo ./scripts/docker-launch.sh deploy --panel-url https://panel.example.com --node-id 12 --api-key-stdin
+#   sudo ./scripts/docker-launch.sh preview --panel-url https://panel.example.com --node-id 12
+#   sudo ./scripts/docker-launch.sh status            # inspect container and staged config
+#   sudo ./scripts/docker-launch.sh logs -f           # follow container logs
+#   sudo ./scripts/docker-launch.sh start|stop|restart|remove
+#   ./scripts/docker-launch.sh --help
 #
-# The actual UI and Docker orchestration live in docker_launcher.py and
-# docker-launcher.html next to this file.  Only the Python standard library is
-# required (Python 3.8+).
+# The CLI and Docker orchestration live in docker_launcher.py next to this
+# file.  Only the Python standard library is required (Python 3.8+).
 
 set -euo pipefail
 
@@ -31,10 +29,6 @@ if [[ ! -f "$SCRIPT_DIR/docker_launcher.py" ]]; then
   echo "错误: 缺少 $SCRIPT_DIR/docker_launcher.py" >&2
   exit 1
 fi
-if [[ ! -f "$SCRIPT_DIR/docker-launcher.html" ]]; then
-  echo "错误: 缺少 $SCRIPT_DIR/docker-launcher.html" >&2
-  exit 1
-fi
 
 if ! command -v "$PYTHON_BIN" >/dev/null 2>&1; then
   echo "错误: 找不到 $PYTHON_BIN。请安装 Python 3.8+，或用 PYTHON_BIN=/path/to/python3 指定。" >&2
@@ -48,10 +42,9 @@ if ! "$PYTHON_BIN" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 8) else
 fi
 
 if ! command -v docker >/dev/null 2>&1; then
-  echo "警告: 未找到 docker 命令。页面仍可生成配置，但无法启动容器。" >&2
+  echo "警告: 未找到 docker 命令。仍可使用 preview/stage 生成配置，但无法校验或启动容器。" >&2
 fi
 
 exec "$PYTHON_BIN" "$SCRIPT_DIR/docker_launcher.py" \
   --repo-root "$REPO_ROOT" \
-  --html "$SCRIPT_DIR/docker-launcher.html" \
   "$@"

@@ -21,7 +21,7 @@
 - [M5-REPORT.md](./M5-REPORT.md)：收尾：回滚事务/证书 E2E/混沌/压测/打包/告警
 - [LIVE-VALIDATION.md](./LIVE-VALIDATION.md)：真实站点联调记录
 - [docs/configuration.md](./docs/configuration.md)：配置说明
-- [docs/docker-launcher.md](./docs/docker-launcher.md)：Docker 一键启动（图形化参数页）
+- [docs/docker-launcher.md](./docs/docker-launcher.md)：Docker 一键部署与管理 CLI
 - [docs/operations.md](./docs/operations.md)：部署/运维
 - [docs/monitoring.md](./docs/monitoring.md)：指标、抓取与告警（`deploy/alerts.yml`）
 - [docs/security-audit.md](./docs/security-audit.md)：安全审计
@@ -44,7 +44,7 @@
 - 流量 `Set(0)` + bbolt journal + 批量推送/ack（at-least-once）
 - `last_good` 启动、面板故障保持服务、崩溃恢复 journal
 - 状态采样：`load` CPU 小数 + cpu/mem/swap/disk/uptime
-- CLI：`run` / `check` / `dump-config` / `version`
+- CLI：`run` / `check` / `dump-config` / `status` / `metrics` / `ready` / `version`
 - Unix socket 管理面：`/healthz`、`/readyz`、`/status`、`/metrics`
 - systemd unit、Dockerfile
 
@@ -69,26 +69,27 @@ Xray 版本固定为 release `v26.11.9` 的 commit 伪版本：
 `v1.260327.1-0.20261109052709-676eaf66f8f0`
 （GitHub tag `v26.11.9` 不是合法 Go module semver）。
 
-## Docker 一键启动（图形化）
+## Docker 一键部署（命令行）
 
 ```bash
-# 默认监听 0.0.0.0；自动生成并打印页面密码
-sudo ./scripts/docker-launch.sh --username admin
+# 交互式配置向导并部署
+sudo ./scripts/docker-launch.sh wizard
 
-# 仅本机访问
-sudo ./scripts/docker-launch.sh --bind 127.0.0.1
+# 非交互式一键部署（推荐从标准输入或环境变量读取 API Key）
+printf '%s\n' "$PANEL_API_KEY" | sudo ./scripts/docker-launch.sh deploy \
+  --panel-url https://panel.example.com \
+  --node-id 12 \
+  --api-key-stdin
 
-# 用哈希文件（不保存明文）
-sudo ./scripts/docker-launch.sh --hash-password --hash-password-output /root/.linkc-node/password.hash
-sudo ./scripts/docker-launch.sh --username admin --password-hash-file /root/.linkc-node/password.hash
+# 预览配置 / 查看容器与节点状态 / 查看日志
+sudo ./scripts/docker-launch.sh preview --panel-url https://panel.example.com --node-id 12
+sudo ./scripts/docker-launch.sh status
+sudo ./scripts/docker-launch.sh node-status
+sudo ./scripts/docker-launch.sh logs -f
 ```
 
-脚本会在本机启动一个带随机 token 的图形化参数页，填写面板地址、API Key、节点 ID 后自动生成
-`config.yaml` / `api-key` / 证书 / `docker-run.sh` 并启动容器。默认使用 host 网络，页面监听
-`0.0.0.0`；**监听 `0.0.0.0` 时必须加 `--username` 启用登录**，否则启动器拒绝启动；仅本机用 `--bind 127.0.0.1`。
-加 `--username` 会自动生成随机密码并打印，同时写入 0600 JSON 凭据文件（默认
-`~/.linkc-node/launcher-credentials.json`）；`--ask-password` 可手动输入，`--password-hash-file`
-可读取 scrypt 哈希文件（不保存明文）。非 root 运行时使用
+`scripts/docker-launch.sh` 是纯命令行部署与管理工具（不启动任何 Web 服务或端口），按参数自动生成
+`config.yaml`、`api-key`（0600）、可选证书与 `docker-run.sh` 并启动容器。非 root 下默认写入
 `~/.linkc-node`。详细说明见 [docs/docker-launcher.md](./docs/docker-launcher.md)。
 
 ## 快速检查 / 运行

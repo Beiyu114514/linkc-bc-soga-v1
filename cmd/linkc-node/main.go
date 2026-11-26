@@ -1,16 +1,21 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"log/slog"
+	"net"
+	"net/http"
 	"os"
 	"os/signal"
 	"strings"
 	"sync"
 	"syscall"
+	"time"
 
 	"github.com/Beiyu114514/linkc-bc-soga-v1/internal/admin"
 	"github.com/Beiyu114514/linkc-bc-soga-v1/internal/agent"
@@ -38,6 +43,8 @@ func run(args []string) error {
 	fs := flag.NewFlagSet(cmd, flag.ContinueOnError)
 	cfgPath := fs.String("c", "/etc/linkc-node/config.yaml", "config file")
 	fs.StringVar(cfgPath, "config", *cfgPath, "config file")
+	sockPath := fs.String("s", "", "admin unix socket path (overrides config admin.socket)")
+	fs.StringVar(sockPath, "socket", "", "admin unix socket path (overrides config admin.socket)")
 	if err := fs.Parse(args[1:]); err != nil {
 		return err
 	}
@@ -57,6 +64,12 @@ func run(args []string) error {
 		return nil
 	case "dump-config":
 		return dumpConfig(*cfgPath)
+	case "status":
+		return printAdminEndpoint(*cfgPath, *sockPath, "/status", true)
+	case "metrics":
+		return printAdminEndpoint(*cfgPath, *sockPath, "/metrics", false)
+	case "ready":
+		return printAdminEndpoint(*cfgPath, *sockPath, "/readyz", false)
 	case "run":
 		return runAgent(*cfgPath)
 	case "help", "-h", "--help":
@@ -67,14 +80,74 @@ func run(args []string) error {
 }
 
 func usage() error {
-	fmt.Fprint(os.Stderr, `usage: linkc-node <run|check|dump-config|version> [-c config.yaml]
+	fmt.Fprint(os.Stderr, `usage: linkc-node <run|check|dump-config|status|metrics|ready|version> [-c config.yaml]
 
   run          start the node agent
   check        validate local config and certificate files
   dump-config  fetch panel config and print the generated Xray JSON (redacted)
+  status       query node status via admin Unix socket
+  metrics      query Prometheus metrics via admin Unix socket
+  ready        check readiness via admin Unix socket
   version      print version
 `)
 	return nil
+}
+
+func resolveAdminSocket(cfgPath, sockPath string) string {
+	if s := strings.TrimSpace(sockPath); s != "" {
+		return s
+	}
+	if cfg, err := config.Load(cfgPath); err == nil && strings.TrimSpace(cfg.Admin.Socket) != "" {
+		return cfg.Admin.Socket
+	}
+	return "/run/linkc-node/admin.sock"
+}
+
+func printAdminEndpoint(cfgPath, sockPath, endpoint string, prettyJSON bool) error {
+	body, err := queryAdmin(resolveAdminSocket(cfgPath, sockPath), endpoint)
+	if err != nil {
+		return err
+	}
+	if prettyJSON {
+		var buf bytes.Buffer
+		if err := json.Indent(&buf, body, "", "  "); err == nil {
+			fmt.Println(buf.String())
+			return nil
+		}
+	}
+	fmt.Print(string(body))
+	if len(body) > 0 && body[len(body)-1] != '\n' {
+		fmt.Println()
+	}
+	return nil
+}
+
+func queryAdmin(socketPath, endpoint string) ([]byte, error) {
+	if strings.TrimSpace(socketPath) == "" {
+		return nil, fmt.Errorf("empty admin socket path")
+	}
+	dialer := &net.Dialer{Timeout: 3 * time.Second}
+	client := &http.Client{
+		Timeout: 5 * time.Second,
+		Transport: &http.Transport{
+			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+				return dialer.DialContext(ctx, "unix", socketPath)
+			},
+		},
+	}
+	resp, err := client.Get("http://localhost" + endpoint)
+	if err != nil {
+		return nil, fmt.Errorf("query %s via %s: %w", endpoint, socketPath, err)
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
+	if err != nil {
+		return nil, fmt.Errorf("read %s response: %w", endpoint, err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("admin %s returned HTTP %d: %s", endpoint, resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+	return body, nil
 }
 
 func loggerFor(cfg config.Config) *slog.Logger {
@@ -259,6 +332,14 @@ func redact(v any) {
 				"shortids", "short_ids", "headers",
 				"echserverkeys", "ech_server_keys", "mldsa65seed", "mldsa65_seed":
 				x[k] = "***"
+			case "decryption":
+				if s, ok := val.(string); ok {
+					if trimmed := strings.TrimSpace(s); trimmed != "" && !strings.EqualFold(trimmed, "none") {
+						x[k] = "***"
+					}
+				} else if val != nil {
+					x[k] = "***"
+				}
 			default:
 				redact(val)
 			}
