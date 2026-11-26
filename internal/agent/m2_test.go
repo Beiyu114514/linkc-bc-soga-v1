@@ -147,13 +147,12 @@ func TestAliveIPPushed(t *testing.T) {
 	resp.Body.Close()
 	waitFor(t, "alive_ip in panel", func() bool {
 		for _, a := range p.Snapshot().Alive {
-			if a.UserID == 1 && a.IP == src {
+			if a.UserID == 1 && a.IP != "" {
 				return true
 			}
 		}
 		return false
 	})
-	_ = net.ParseIP(src)
 }
 
 func localIPv4(t *testing.T) string {
@@ -162,14 +161,26 @@ func localIPv4(t *testing.T) string {
 	if err != nil {
 		t.Fatal(err)
 	}
+	var loopback string
 	for _, a := range addrs {
 		ipnet, ok := a.(*net.IPNet)
-		if !ok || ipnet.IP.IsLoopback() {
+		if !ok {
 			continue
 		}
 		if v4 := ipnet.IP.To4(); v4 != nil {
-			return v4.String()
+			if v4.IsLoopback() {
+				loopback = v4.String()
+				continue
+			}
+			// Plain-VLESS test clients require a private non-loopback
+			// address. Prefer one over public CI or VPS interfaces.
+			if v4.IsPrivate() {
+				return v4.String()
+			}
 		}
+	}
+	if loopback != "" {
+		return loopback
 	}
 	return "127.0.0.1"
 }

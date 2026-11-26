@@ -47,7 +47,10 @@ release-artifacts: clean-dist
 	$(MAKE) linux-amd64 linux-arm64 VERSION=$(VERSION) DATE=$(DATE)
 	$(MAKE) package-deb package-rpm VERSION=$(VERSION) ARCH=amd64 DATE=$(DATE)
 	$(MAKE) package-deb package-rpm VERSION=$(VERSION) ARCH=arm64 DATE=$(DATE)
-	cd dist && sha256sum * > SHA256SUMS
+	install -m 0644 LICENSE THIRD_PARTY_NOTICES.md dist/
+	cd dist && find . -maxdepth 1 -type f ! -name 'SHA256SUMS*' -printf '%f\0' \
+		| sort -z | xargs -0 sha256sum > SHA256SUMS.tmp
+	mv dist/SHA256SUMS.tmp dist/SHA256SUMS
 
 package-deb: linux-$(ARCH)
 	mkdir -p dist

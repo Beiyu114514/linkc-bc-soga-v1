@@ -5,6 +5,7 @@
 *.db
 *.db.bak
 *.md
+!THIRD_PARTY_NOTICES.md
 tmp
 dist
 docs

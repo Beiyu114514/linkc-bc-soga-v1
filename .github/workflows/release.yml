@@ -80,7 +80,17 @@ jobs:
           make linux-amd64 linux-arm64 VERSION="$version" DATE="$date"
           make package-deb package-rpm VERSION="$version" ARCH=amd64 DATE="$date"
           make package-deb package-rpm VERSION="$version" ARCH=arm64 DATE="$date"
-          (cd dist && sha256sum * > SHA256SUMS)
+          for document in LICENSE THIRD_PARTY_NOTICES.md; do
+            if [ -f "$document" ]; then
+              install -m 0644 "$document" dist/
+            fi
+          done
+          (
+            cd dist
+            find . -maxdepth 1 -type f ! -name 'SHA256SUMS*' -printf '%f\0' |
+              sort -z | xargs -0 sha256sum > SHA256SUMS.tmp
+            mv SHA256SUMS.tmp SHA256SUMS
+          )
           ls -l dist
 
       - name: Publish release
@@ -92,6 +102,11 @@ jobs:
           version="${TAG#v}"
           notes="docs/release-notes-${version}.md"
           assets=(dist/*.deb dist/*.rpm dist/linkc-node-linux-* dist/SHA256SUMS)
+          for document in dist/LICENSE dist/THIRD_PARTY_NOTICES.md; do
+            if [ -f "$document" ]; then
+              assets+=("$document")
+            fi
+          done
           prerelease_flag=()
           if [[ "$TAG" == *-* ]]; then
             prerelease_flag=(--prerelease)

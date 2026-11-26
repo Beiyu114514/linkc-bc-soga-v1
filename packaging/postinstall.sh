@@ -15,15 +15,20 @@ if ! getent passwd linkc >/dev/null 2>&1; then
         linkc
 fi
 
-install -d -m 0700 -o linkc -g linkc /etc/linkc-node /var/lib/linkc-node
+install -d -m 0750 -o root -g linkc /etc/linkc-node
+install -d -m 0700 -o linkc -g linkc /var/lib/linkc-node
 if [ -d /var/lib/linkc-node ] && [ ! -L /var/lib/linkc-node ]; then
     chown -hR linkc:linkc /var/lib/linkc-node
 fi
 
-# The package owns config.yaml as root:root; the service runs as linkc.
+# The service can read the config but cannot replace it.
 if [ -f /etc/linkc-node/config.yaml ] && [ ! -L /etc/linkc-node/config.yaml ]; then
-    chown linkc:linkc /etc/linkc-node/config.yaml
-    chmod 0600 /etc/linkc-node/config.yaml
+    chown root:linkc /etc/linkc-node/config.yaml
+    chmod 0640 /etc/linkc-node/config.yaml
+fi
+if [ -d /etc/linkc-node ] && [ ! -L /etc/linkc-node ]; then
+    chown root:linkc /etc/linkc-node
+    chmod 0750 /etc/linkc-node
 fi
 
 is_upgrade=0

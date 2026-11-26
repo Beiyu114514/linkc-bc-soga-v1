@@ -1,5 +1,5 @@
 # /etc/linkc-node/config.yaml
-# Permissions: 0600; directory: 0700.
+# Permissions: root:linkc 0640; directory: root:linkc 0750.
 panel:
   # Keep the exact path the panel uses for authorization/binding.
   base_url: "https://panel.example.com/"

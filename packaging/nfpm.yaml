@@ -6,7 +6,7 @@ section: net
 priority: optional
 maintainer: LinkC
 description: soga-v1 VLESS node agent with embedded Xray-core
-license: UNLICENSED
+license: LicenseRef-Proprietary
 depends:
   - passwd
   - libc-bin
@@ -35,12 +35,26 @@ contents:
     dst: /etc/linkc-node/config.yaml
     type: config|noreplace
     file_info:
-      mode: 0600
+      owner: root
+      group: linkc
+      mode: 0640
   - dst: /var/lib/linkc-node
     type: dir
     file_info:
+      owner: linkc
+      group: linkc
       mode: 0700
   - dst: /etc/linkc-node
     type: dir
     file_info:
-      mode: 0700
+      owner: root
+      group: linkc
+      mode: 0750
+  - src: LICENSE
+    dst: /usr/share/doc/linkc-node/LICENSE
+    file_info:
+      mode: 0644
+  - src: THIRD_PARTY_NOTICES.md
+    dst: /usr/share/doc/linkc-node/THIRD_PARTY_NOTICES.md
+    file_info:
+      mode: 0644

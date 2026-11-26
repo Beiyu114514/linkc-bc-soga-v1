@@ -1,0 +1,37 @@
+name: Feature request
+description: Propose a focused improvement to linkc-node.
+title: "[Feature]: "
+labels: ["enhancement", "needs-triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Describe the user problem first. Requests that depend on a fork-specific panel protocol should link to the relevant public API contract.
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What deployment or operational problem are you trying to solve?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: Describe the smallest useful change and any alternatives considered.
+    validations:
+      required: true
+  - type: textarea
+    id: compatibility
+    attributes:
+      label: Compatibility and security impact
+      description: Note configuration, API, migration, or security implications.
+    validations:
+      required: true
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Checklist
+      options:
+        - label: I searched existing issues and documentation.
+          required: true

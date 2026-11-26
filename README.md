@@ -1,163 +1,202 @@
-# linkc-bc-soga-v1
+# linkc-node
 
-[![ci](https://github.com/Beiyu114514/linkc-bc-soga-v1/actions/workflows/ci.yml/badge.svg)](https://github.com/Beiyu114514/linkc-bc-soga-v1/actions/workflows/ci.yml)
-[![docker](https://github.com/Beiyu114514/linkc-bc-soga-v1/actions/workflows/docker.yml/badge.svg)](https://github.com/Beiyu114514/linkc-bc-soga-v1/actions/workflows/docker.yml)
+[![CI](https://github.com/Beiyu114514/linkc-bc-soga-v1/actions/workflows/ci.yml/badge.svg)](https://github.com/Beiyu114514/linkc-bc-soga-v1/actions/workflows/ci.yml)
+[![Docker](https://github.com/Beiyu114514/linkc-bc-soga-v1/actions/workflows/docker.yml/badge.svg)](https://github.com/Beiyu114514/linkc-bc-soga-v1/actions/workflows/docker.yml)
+[![Release](https://img.shields.io/github/v/release/Beiyu114514/linkc-bc-soga-v1)](https://github.com/Beiyu114514/linkc-bc-soga-v1/releases)
+[![Go](https://img.shields.io/badge/Go-1.27%2B-00ADD8?logo=go)](go.mod)
 
-基于 **Xray-core** 的 soga-v1 节点后端（soga 替代品）。
+**linkc-node** 是一个自托管的 VLESS 节点代理，面向
+**SSPanel-UIM + SogaController（soga-v1 WebAPI）** 部署场景。它将 Xray-core
+内嵌到单个 Go 二进制中，提供用户同步、流量上报、在线 IP、审计、限额、热更新和本地管理接口。
 
-- **目标站点**：SSPanel-UIM + `SogaController`（soga-v1 WebAPI 服务端）
-- **本程序**：节点侧客户端，内嵌 Xray-core，运行 VLESS 节点
-- **当前阶段**：**M5 收尾完成**；等待 24h 长稳实跑与目标机（systemd/SELinux）兼容性验收
+> [!IMPORTANT]
+> 项目仍处于 `0.x` 阶段。生产部署前请在目标系统完成升级、回滚和故障恢复演练，并遵守所在地法律法规及上游服务条款。
 
-## 文档
+## 功能
 
-- [docs/usage.md](./docs/usage.md)：**使用文档**（安装 → 配置 → 启动验证 → 常用操作 → 排障）
-- [docs/quickstart.md](./docs/quickstart.md)：**一键启动脚本**（`scripts/quickstart.sh`）
-- [PLAN.md](./PLAN.md)：总体技术规划（v0.9）
-- [M0-REPORT.md](./M0-REPORT.md)：技术验证结果
-- [M1-REPORT.md](./M1-REPORT.md)：MVP 实现、测试与遗留
-- [M2-REPORT.md](./M2-REPORT.md)：审计/alive_ip/协议完整性与剩余项
-- [M3-REPORT.md](./M3-REPORT.md)：限额/审计执行与压测遗留
-- [M4-REPORT.md](./M4-REPORT.md)：加固、证书/SIGHUP、打包与验收遗留
-- [M5-REPORT.md](./M5-REPORT.md)：收尾：回滚事务/证书 E2E/混沌/压测/打包/告警
-- [LIVE-VALIDATION.md](./LIVE-VALIDATION.md)：真实站点联调记录
-- [docs/configuration.md](./docs/configuration.md)：配置说明
-- [docs/docker-launcher.md](./docs/docker-launcher.md)：Docker 一键部署与管理 CLI
-- [docs/operations.md](./docs/operations.md)：部署/运维
-- [docs/monitoring.md](./docs/monitoring.md)：指标、抓取与告警（`deploy/alerts.yml`）
-- [docs/security-audit.md](./docs/security-audit.md)：安全审计
-- [docs/p0-live-validation.md](./docs/p0-live-validation.md)：真实站点联调清单
+- **面板兼容**：对接 SSPanel-UIM 的 soga-v1 节点接口，支持用户、路由、审计规则和流量同步。
+- **单二进制部署**：内嵌 Xray-core，无额外运行时依赖，可作为 systemd 服务或容器运行。
+- **协议覆盖**：VLESS over TCP/WS，支持 TLS、REALITY、Vision、XHTTP 和 gRPC 传输配置。
+- **可靠同步**：ETag/304 缓存、请求重试、`last_good` 启动、流量 journal 和 at-least-once 上报。
+- **运行时更新**：用户热添加/移除、同端口 inbound 切换、失败回滚和证书热加载。
+- **治理能力**：全局/用户限速、设备数、TCP 连接限制、审计规则、白名单和在线 IP 上报。
+- **本地管理面**：Unix socket 提供 `/healthz`、`/readyz`、`/status` 和 Prometheus `/metrics`。
+- **多种部署方式**：一键脚本、deb/rpm、systemd、Docker Compose 兼容的容器命令。
 
-## 已实现（M1）
+## 快速开始
 
-- 内嵌 Xray-core，VLESS + TCP / WS + TLS / REALITY；Vision 已验证
-- soga-v1 客户端：`/node`、`/users`、`/traffic`、`/status`
-- ETag/304 持久化缓存、GET 重试/退避
-- 用户热添加/移除、UUID 冲突检测、空用户列表、批量删除安全阀
-- 审计规则/白名单拉取、regex/keyword/ip/port 匹配、report/block、去重队列
-- `alive_ip` changed/full 推送；`traffic.include_online_zero`
-- XHTTP/GRPC 实际 TLS 传输；ECH/decryption 配置映射
-- 节点全局限速、用户限速、设备数（IPv6 /64）、TCP 限制
-- geosite/geoip 审计、域名解析 IP 规则
-- 多证书/SNI、SIGHUP 证书热加载、inbound 切换失败保留旧配置
-- inbound 热切换事务化：旧移除失败自动回滚到上一份配置（`Engine.SwapInbound`）
-- 同端口 inbound 热切换（`SO_REUSEPORT`）
-- 流量 `Set(0)` + bbolt journal + 批量推送/ack（at-least-once）
-- `last_good` 启动、面板故障保持服务、崩溃恢复 journal
-- 状态采样：`load` CPU 小数 + cpu/mem/swap/disk/uptime
-- CLI：`run` / `check` / `dump-config` / `status` / `metrics` / `ready` / `version`
-- Unix socket 管理面：`/healthz`、`/readyz`、`/status`、`/metrics`
-- systemd unit、Dockerfile
+### 使用一键脚本
 
-## 构建
-
-需要 Go 1.27+：
+适合从源码仓库部署或升级 systemd 服务：
 
 ```bash
-export PATH=/usr/local/go/bin:$PATH
-go build -trimpath -o linkc-node ./cmd/linkc-node
-```
+git clone https://github.com/Beiyu114514/linkc-bc-soga-v1.git
+cd linkc-bc-soga-v1
 
-## 发布
-
-- 打 tag `vX.Y.Z` 会触发 `.github/workflows/release.yml`：构建 amd64/arm64 二进制、deb/rpm 与 `SHA256SUMS`，并创建 GitHub Release。
-- `.github/workflows/docker.yml` 构建多架构镜像并推送到 `ghcr.io/beiyu114514/linkc-bc-soga-v1`：
-  标签 → `X.Y.Z` / `X.Y` / `latest`，`main` → `edge`，另附 `sha-<short>`。
-- 本地复现发布产物：`make release-artifacts VERSION=0.10.0`。
-- 手动重建某个 tag：`gh workflow run release.yml -f tag=v0.10.0`。
-
-Xray 版本固定为 release `v26.11.9` 的 commit 伪版本：
-`v1.260327.1-0.20261109052709-676eaf66f8f0`
-（GitHub tag `v26.11.9` 不是合法 Go module semver）。
-
-## 一键启动（推荐）
-
-一条命令完成「生成配置 → 本地校验 → 安装 systemd 服务 → 启动 → 等就绪」：
-
-```bash
-# 非交互（API Key 走标准输入，不进 ps）
 printf '%s\n' "$PANEL_API_KEY" | sudo ./scripts/quickstart.sh \
   --panel-url https://panel.example.com \
   --node-id 12 \
   --api-key-stdin
-
-# 交互式向导
-sudo ./scripts/quickstart.sh wizard
-
-# 只预览，不写文件
-./scripts/quickstart.sh --dry-run --panel-url https://panel.example.com --node-id 12 --api-key-env PANEL_API_KEY
 ```
 
-脚本会生成 `/etc/linkc-node/config.yaml`（`root:linkc` 0640）与 `/etc/linkc-node/api-key`
-（`linkc:linkc` 0600），复用 `scripts/install.sh` 安装 `linkc` 用户与 systemd unit；
-`check` 通过后启用并重启服务，最后轮询 `readyz` 并打印 `status`，未就绪时自动附带最近日志。
-
-`--mode docker` 会转调下面的 `scripts/docker-launch.sh deploy`；`--mode foreground` 直接前台运行。
-完整参数见 `./scripts/quickstart.sh --help` 与 [docs/quickstart.md](./docs/quickstart.md)。
-
-## Docker 一键部署（命令行）
+交互式部署：
 
 ```bash
-# 交互式配置向导并部署
-sudo ./scripts/docker-launch.sh wizard
+sudo ./scripts/quickstart.sh wizard
+```
 
-# 非交互式一键部署（推荐从标准输入或环境变量读取 API Key）
-printf '%s\n' "$PANEL_API_KEY" | sudo ./scripts/docker-launch.sh deploy \
+只预览配置和命令，不写文件：
+
+```bash
+./scripts/quickstart.sh --dry-run \
   --panel-url https://panel.example.com \
   --node-id 12 \
-  --api-key-stdin
-
-# 预览配置 / 查看容器与节点状态 / 查看日志
-sudo ./scripts/docker-launch.sh preview --panel-url https://panel.example.com --node-id 12
-sudo ./scripts/docker-launch.sh status
-sudo ./scripts/docker-launch.sh node-status
-sudo ./scripts/docker-launch.sh logs -f
+  --api-key-env PANEL_API_KEY
 ```
 
-`scripts/docker-launch.sh` 是纯命令行部署与管理工具（不启动任何 Web 服务或端口），按参数自动生成
-`config.yaml`、`api-key`（root 下 0640，非 root 下 0600）、可选证书与 `docker-run.sh` 并启动容器。非 root 下默认写入
-`~/.linkc-node`。详细说明见 [docs/docker-launcher.md](./docs/docker-launcher.md)。
+脚本会创建低权限 `linkc` 用户，安装二进制和 systemd unit，校验配置后启用并重启服务。
+配置文件为 `root:linkc 0640`，服务用户只能读取，不能替换。
 
-## 快速检查 / 运行
+### 使用安装包
+
+从 [最新 Release](https://github.com/Beiyu114514/linkc-bc-soga-v1/releases/latest)
+下载对应架构的 deb 或 rpm：
 
 ```bash
-PANEL_API_KEY=... ./linkc-node check -c configs/linkc-node.example.yaml
-PANEL_API_KEY=... ./linkc-node dump-config -c configs/linkc-node.example.yaml
-PANEL_API_KEY=... ./linkc-node run -c configs/linkc-node.example.yaml
+sudo apt install ./linkc-node_0.12.0_amd64.deb
+# RPM 系统改用：sudo rpm -Uvh linkc-node-0.12.0-1.x86_64.rpm
+
+read -rsp 'Panel API key: ' PANEL_API_KEY; echo
+printf '%s\n' "$PANEL_API_KEY" |
+  sudo tee /etc/linkc-node/api-key >/dev/null
+sudo chown linkc:linkc /etc/linkc-node/api-key
+sudo chmod 0600 /etc/linkc-node/api-key
+
+sudoedit /etc/linkc-node/config.yaml
+sudo -u linkc linkc-node check -c /etc/linkc-node/config.yaml
+sudo systemctl enable --now linkc-node
 ```
 
-管理面：
+### 使用容器
 
 ```bash
-curl --unix-socket /run/linkc-node/admin.sock http://localhost/status
-curl --unix-socket /run/linkc-node/admin.sock http://localhost/metrics
+docker pull ghcr.io/beiyu114514/linkc-bc-soga-v1:latest
+
+sudo install -d -m 0750 -o root -g 10001 /etc/linkc-node
+sudo install -d -m 0700 -o 10001 -g 10001 \
+  /var/lib/linkc-node /var/lib/linkc-node/run
+
+# 准备 /etc/linkc-node/config.yaml 与 /etc/linkc-node/api-key
+# 文件需对 UID 10001 可读；更推荐使用 scripts/docker-launch.sh 自动生成
+docker run --detach --name linkc-node --network host \
+  -v /etc/linkc-node:/etc/linkc-node:ro \
+  -v /var/lib/linkc-node:/var/lib/linkc-node \
+  -v /var/lib/linkc-node/run:/run/linkc-node \
+  ghcr.io/beiyu114514/linkc-bc-soga-v1:latest
 ```
 
-## 测试
+容器必须使用 host 网络，否则真实源 IP 和低端口绑定行为会受到影响。可进一步阅读
+[Docker 命令行部署](docs/docker-launcher.md)，由其处理配置、密钥、证书和容器回滚。
+
+## 配置
+
+最小配置示例：
+
+```yaml
+panel:
+  base_url: "https://panel.example.com/"
+  profile: "sspanel-uim-soga"
+  api_key_file: "/etc/linkc-node/api-key"
+  node_id: "12"
+  node_type: "vless"
+
+node:
+  listen: "0.0.0.0"
+
+storage:
+  path: "/var/lib/linkc-node"
+
+admin:
+  socket: "/run/linkc-node/admin.sock"
+  metrics: true
+```
+
+完整字段、协议和限制说明见 [配置文档](docs/configuration.md)。
+
+## 运维与排障
 
 ```bash
-go test ./... -count=1
-go test -race ./... -count=1
-go vet ./...
-# 随机故障注入长稳（默认跳过；SOAK_DURATION=24h 跑全天候）
-SOAK_DURATION=60s go test ./internal/agent -run TestSoak -count=1
-# 基准
-go test ./internal/xray -run '^$' -bench . -benchtime 20x
+sudo systemctl status linkc-node
+sudo journalctl -u linkc-node -f
+sudo linkc-node check -c /etc/linkc-node/config.yaml
+sudo linkc-node status -c /etc/linkc-node/config.yaml
+curl --unix-socket /run/linkc-node/admin.sock http://localhost/readyz
 ```
 
-测试覆盖：mock panel 契约、ETag/重试、bbolt journal、用户热更新、空 users、同端口切换、
-TCP/WS+TLS/REALITY/XHTTP/GRPC、审计命中、alive_ip、面板故障保持服务、last_good 重启、
-inbound 回滚事务（5 分支）、证书轮换/多证书 SNI、面板 5xx/429/journal 写满混沌、10k 用户与吞吐。
+常用文档：
 
-## 尚未实现
+- [部署与运维](docs/operations.md)
+- [升级与回滚](docs/upgrade.md)
+- [一键启动脚本](docs/quickstart.md)
+- [Docker 命令行部署](docs/docker-launcher.md)
+- [监控与告警](docs/monitoring.md)
+- [常见问题](docs/faq.md)
+- [安全说明](SECURITY.md)
 
-- 24h 长稳实跑（harness 已就绪：`make soak`）
-- systemd 沙箱/SELinux/AppArmor 目标机兼容性（见 `docs/security-audit.md` S1/S2）
-- ECH 实际握手测试（缺合法测试 key set）
-- 多出口 IPv6 压测；站点侧 P0 待确认项（见 PLAN §17）
+## 构建与测试
 
-## 注意
+需要 Go 1.27 或更高版本。
 
-- 目标站点源码归档包含站点配置与 `.git`，请按敏感资料保管，不要提交到公开仓库。
-- 生产环境默认 `freedom.allow_private_targets=false`，防止 SSRF。
-- 面板 API key、UUID、REALITY 私钥不要提交到仓库。
+```bash
+make build
+make test
+make race
+make vet
+make test-launcher
+make test-quickstart
+```
+
+生成发布资产：
+
+```bash
+make release-artifacts VERSION=0.12.0
+```
+
+发布流程和产物说明见 [CONTRIBUTING.md](CONTRIBUTING.md)。
+
+## 兼容性
+
+| 项目 | 支持范围 |
+|---|---|
+| Linux | amd64、arm64 |
+| systemd | 支持 `Type=simple` 服务与低端口 capability |
+| 容器 | `linux/amd64`、`linux/arm64` |
+| 面板 | SSPanel-UIM + SogaController（soga-v1） |
+| Go | `go.mod` 中声明的版本或更新版本 |
+
+Windows、macOS、Windows 容器和非 systemd 发行版未作为发布目标验证。
+
+## 安全
+
+- 不要提交或公开 API Key、节点 UUID、REALITY 私钥、证书私钥和生产配置。
+- 生产环境保持 `node.freedom.allow_private_targets: false`，避免 SSRF。
+- 安全漏洞请通过 [GitHub Security Advisory](https://github.com/Beiyu114514/linkc-bc-soga-v1/security/advisories/new)
+  私下报告，不要在公开 issue 中披露利用细节。
+
+## 参与贡献
+
+提交代码前请阅读 [CONTRIBUTING.md](CONTRIBUTING.md)。参与项目即表示同意遵守
+[CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md)。
+
+## 项目状态与边界
+
+- 这是第三方、独立维护的项目，与 Xray-core、SSPanel-UIM 或 Soga 的维护者没有隶属关系。
+- 本项目只提供节点侧代理与管理能力，不提供面板、订阅页、支付或用户运营系统。
+- 目标站点源码、站点数据库和用户凭据不属于本仓库，也不应提交到本仓库。
+- 历史设计和验收记录保留在 `M0-REPORT.md` 至 `M5-REPORT.md`、`PLAN.md` 与
+  [发布记录](CHANGELOG.md)中，仅用于开发追溯，不代表当前版本的兼容性承诺。
+
+## 许可证
+
+本仓库当前采用“保留所有权利”的源代码可见许可，详见 [LICENSE](LICENSE)。
+第三方依赖仍受各自许可证约束，详见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。

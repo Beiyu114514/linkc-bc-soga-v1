@@ -26,6 +26,7 @@ ARG BUILD_DATE=unknown
 LABEL org.opencontainers.image.title="linkc-node" \
       org.opencontainers.image.description="soga-v1 VLESS node agent with embedded Xray-core" \
       org.opencontainers.image.source="https://github.com/Beiyu114514/linkc-bc-soga-v1" \
+      org.opencontainers.image.licenses="LicenseRef-Proprietary" \
       org.opencontainers.image.version="${VERSION}" \
       org.opencontainers.image.revision="${COMMIT}" \
       org.opencontainers.image.created="${BUILD_DATE}"
@@ -36,6 +37,8 @@ RUN apt-get update \
     && chown -R 10001:10001 /var/lib/linkc-node /run/linkc-node
 COPY --from=build /out/linkc-node /usr/local/bin/linkc-node
 COPY --chmod=0644 configs/linkc-node.example.yaml /etc/linkc-node/config.yaml.example
+COPY LICENSE /usr/share/doc/linkc-node/LICENSE
+COPY THIRD_PARTY_NOTICES.md /usr/share/doc/linkc-node/THIRD_PARTY_NOTICES.md
 # The panel may assign a port below 1024 (the target panel uses 440). The
 # container runs as UID 10001, so grant only the low-port bind capability to
 # the binary instead of running the whole container as root. Docker cannot set
